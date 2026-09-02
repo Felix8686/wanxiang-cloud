@@ -12,7 +12,10 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260902.1",
+    "@types/node": "^26.4.1",
+    "tsx": "^4.23.13",
     "typescript": "^5.9.2",
+    "undici": "^8.10.1",
     "wrangler": "^4.34.0"
   }
 }

@@ -20,5 +20,12 @@
       "database_id": "67f7c38b-2def-4092-ae8a-e6bdfcd55cc3",
       "migrations_dir": "migrations"
     }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "wanxiang-cloud-dev-files"
+    }
   ]
 }
+

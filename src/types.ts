@@ -13,12 +13,42 @@ export interface AiLike {
   run(model: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
+export interface R2ObjectHeaderLike {
+  name: string;
+  size: number;
+  etag: string;
+  httpEtag: string;
+  uploaded: Date;
+  customMetadata?: Record<string, string>;
+}
+
+export interface R2ObjectBodyLike extends R2ObjectHeaderLike {
+  body: ReadableStream;
+  arrayBuffer(): Promise<ArrayBuffer>;
+  text(): Promise<string>;
+  json<T>(): Promise<T>;
+  blob(): Promise<Blob>;
+}
+
+export interface R2BucketLike {
+  get(key: string): Promise<R2ObjectBodyLike | null>;
+  put(
+    key: string,
+    value: ReadableStream | ArrayBuffer | ArrayBufferView | string | Blob | null,
+    options?: { customMetadata?: Record<string, string>; httpMetadata?: Record<string, string> }
+  ): Promise<R2ObjectHeaderLike>;
+  delete(keys: string | string[]): Promise<void>;
+  head(key: string): Promise<R2ObjectHeaderLike | null>;
+}
+
 export interface Env {
   DB: D1Like;
   AI: AiLike;
+  FILES: R2BucketLike;
   APP_TIMEZONE: string;
   AI_MODEL: string;
   WANXIANG_API_KEY?: string;
+  API_BEARER_TOKEN?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
 }
@@ -46,4 +76,19 @@ export interface TelegramUpdate {
     chat: { id: number };
     text?: string;
   };
+}
+
+export interface SyncFileRecord {
+  id: string;
+  path: string;
+  object_key: string;
+  content_hash: string;
+  version: number;
+  size_bytes: number;
+  modified_at: string;
+  last_source: string;
+  is_deleted: number;
+  deleted_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
