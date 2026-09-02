@@ -17,7 +17,7 @@
     {
       "binding": "DB",
       "database_name": "wanxiang-cloud-dev",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+      "database_id": "67f7c38b-2def-4092-ae8a-e6bdfcd55cc3",
       "migrations_dir": "migrations"
     }
   ]
