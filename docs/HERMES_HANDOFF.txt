@@ -1,0 +1,75 @@
+目标：在不修改 main 的前提下，把 wanxiang-cloud v0.1 开发分支部署到 Cloudflare 开发环境，并完成真实 Telegram + D1 闭环验收。
+
+仓库：https://github.com/Felix8686/wanxiang-cloud
+工作分支：dev/v0.1-cloud-core
+
+硬性边界：
+1. 禁止向 main 提交、合并或 force push。
+2. 禁止把 Token、API Key、Webhook Secret 写入 Git、README、日志或交接文档。
+3. 本次只部署开发环境 wanxiang-cloud-dev，不创建生产环境。
+4. 不改变“AI 只解析，Worker 校验并写库”的架构边界。
+5. 遇到错误时优先查明根因，不得通过关闭鉴权、取消 webhook secret、公开 API 等方式绕过。
+
+执行步骤：
+
+一、拉取并切换开发分支
+- clone 或 pull 仓库。
+- git switch dev/v0.1-cloud-core
+- 确认当前分支不是 main。
+
+二、安装与基础检查
+- npm install
+- 检查 package.json、wrangler.jsonc、migrations/0001_init.sql、src/index.ts、src/ai.ts。
+- 运行 npm run types；若因当前轻量类型定义导致生成文件不需要入库，不要擅自改架构。
+
+三、创建 D1 开发数据库
+- 使用当前 Cloudflare 账号创建 D1：wanxiang-cloud-dev。
+- 将 Cloudflare 返回的 database_id 写入 wrangler.jsonc 中 REPLACE_WITH_D1_DATABASE_ID 的位置。
+- database_id 可以提交 Git；任何凭据不可提交。
+- 执行远程 migration，确认 accounts、categories、transactions、events、ingestion_log 均存在。
+
+四、配置 Secrets
+通过 wrangler secret put 配置以下三个 Secret：
+- WANXIANG_API_KEY：随机生成足够长度的 API Key。
+- TELEGRAM_BOT_TOKEN：使用用户指定的 Telegram Bot Token；如果当前环境已有明确用于万象云的 Bot，优先复用；如果无法确定 Bot，停止并报告“缺少明确 Telegram Bot”，不要猜测。
+- TELEGRAM_WEBHOOK_SECRET：随机生成，仅允许 A-Z、a-z、0-9、_、-。
+
+五、部署开发 Worker
+- npm run deploy
+- 记录实际 workers.dev URL。
+- GET /health，要求返回 ok=true 和 version=0.1.0。
+
+六、配置 Telegram webhook
+- 调用 Telegram setWebhook。
+- URL = https://实际 Worker 地址/telegram/webhook
+- secret_token = TELEGRAM_WEBHOOK_SECRET
+- allowed_updates 至少包含 message。
+- 调用 getWebhookInfo 确认 webhook URL 正确且没有持续错误。
+
+七、真实验收
+按顺序通过 Telegram 发送：
+A. 晚饭25元
+预期：机器人回复已记录支出，分类应为餐饮，金额 25.00。
+
+B. 今天花了多少钱
+预期：机器人返回当天已记录支出，至少包含刚才的 25.00。
+
+C. 发送一句无法可靠理解为记账或今日支出查询的普通文本。
+预期：不写入 transactions，并明确表示没有改动数据。
+
+八、数据库核验
+- 查询 transactions，确认 A 只产生一条交易。
+- 金额必须按 amount_fen=2500 存储。
+- source 应为 telegram。
+- ingestion_log 应存在对应处理记录。
+- 确认 C 没有产生交易。
+
+九、结果回传与 Git
+- 若 wrangler.jsonc 的 database_id 已替换，将该非敏感配置提交到 dev/v0.1-cloud-core。
+- 新建或更新 docs/HERMES_RESULT.md，记录：部署 URL、测试时间、A/B/C 是否通过、D1 核验是否通过、发现的问题。严禁写任何 Secret/Token/API Key。
+- commit 并 push 到 dev/v0.1-cloud-core。
+- 禁止合并 main。
+
+最终只向用户通知：
+- 成功：wanxiang-cloud v0.1 云端闭环验收成功，结果已推送 GitHub 开发分支。
+- 失败：wanxiang-cloud v0.1 云端闭环验收失败，结果与阻塞原因已推送 GitHub 开发分支。
