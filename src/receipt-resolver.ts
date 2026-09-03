@@ -171,7 +171,7 @@ function stripProductLine(line: string): string {
   return cleanText(
     line
       .replace(/^\s*\d{1,3}\s*[.、:：]\s*/, '')
-      .replace(/\s+\d{6,18}\s*$/, '')
+      .replace(/\s+\d{5,18}\s*$/, '')
       .replace(/\s{2,}/g, ' '),
     160
   );
