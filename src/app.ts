@@ -1,9 +1,17 @@
 import coreHandler from './index';
-import { processTelegramReceipt, selectLargestPhoto } from './receipt';
-import type { Env, TelegramUpdate, TelegramPhotoSize } from './types';
+import { selectLargestPhoto } from './receipt';
+import { enqueueReceiptJob, processReceiptQueueJob } from './receipt-job';
+import type { Env, TelegramUpdate } from './types';
+import type { ReceiptQueueJob } from './receipt-job';
 
-interface ExecutionContextLike {
-  waitUntil(promise: Promise<unknown>): void;
+interface QueueMessageLike<T> {
+  body: T;
+  ack(): void;
+  retry(): void;
+}
+
+interface QueueBatchLike<T> {
+  messages: QueueMessageLike<T>[];
 }
 
 function jsonResponse(data: unknown, status = 200): Response {
@@ -39,34 +47,16 @@ async function sendTelegramMessage(env: Env, chatId: number, text: string): Prom
   if (!response.ok) throw new Error(`TELEGRAM_SEND_HTTP_${response.status}`);
 }
 
-async function handleReceiptPhoto(
-  env: Env,
-  input: {
-    chatId: number;
-    messageId: number;
-    updateId: number;
-    photo: TelegramPhotoSize;
-    caption: string;
-  }
-): Promise<void> {
+async function sendTelegramMessageSafely(env: Env, chatId: number, text: string): Promise<void> {
   try {
-    const result = await processTelegramReceipt(env, {
-      ...input,
-      localNow: getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai')
-    });
-    await sendTelegramMessage(env, input.chatId, result.message);
+    await sendTelegramMessage(env, chatId, text);
   } catch (error) {
-    console.error('telegram receipt background task failed', error instanceof Error ? error.message : 'unknown error');
-    try {
-      await sendTelegramMessage(env, input.chatId, '小票处理失败，数据未写入。请稍后重新发送。');
-    } catch (replyError) {
-      console.error('telegram receipt error reply failed', replyError instanceof Error ? replyError.message : 'unknown error');
-    }
+    console.error('telegram receipt reply failed', error instanceof Error ? error.message : 'unknown error');
   }
 }
 
 export default {
-  async fetch(request: Request, env: Env, ctx?: ExecutionContextLike): Promise<Response> {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
 
@@ -74,8 +64,9 @@ export default {
       return jsonResponse({
         ok: true,
         service: 'wanxiang-cloud',
-        version: '0.3.0',
+        version: '0.3.1',
         receipt_vision: true,
+        receipt_queue_bound: !!env.RECEIPT_QUEUE,
         receipt_vision_model: env.RECEIPT_VISION_MODEL || '@cf/google/gemma-4-26b-a4b-it',
         r2_bound: !!env.FILES,
         d1_bound: !!env.DB
@@ -114,20 +105,39 @@ export default {
       return jsonResponse({ ok: true, ignored: true });
     }
 
-    const task = handleReceiptPhoto(env, {
+    const job: ReceiptQueueJob = {
       chatId,
       messageId,
       updateId: update.update_id,
       photo,
-      caption: update.message?.caption?.trim() || ''
+      caption: update.message?.caption?.trim() || '',
+      localNow: getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai')
+    };
+
+    const enqueueResult = await enqueueReceiptJob(env, job);
+    await sendTelegramMessageSafely(env, chatId, enqueueResult.message);
+
+    return jsonResponse({
+      ok: true,
+      receipt: true,
+      accepted: enqueueResult.queued,
+      duplicate: enqueueResult.duplicate || false,
+      in_progress: enqueueResult.inProgress || false,
+      source_id: enqueueResult.sourceId
     });
+  },
 
-    if (ctx?.waitUntil) {
-      ctx.waitUntil(task);
-      return jsonResponse({ ok: true, receipt: true, accepted: true });
+  async queue(batch: QueueBatchLike<ReceiptQueueJob>, env: Env): Promise<void> {
+    for (const message of batch.messages) {
+      const job = message.body;
+      try {
+        const result = await processReceiptQueueJob(env, job);
+        await sendTelegramMessage(env, job.chatId, result.message);
+        message.ack();
+      } catch (error) {
+        console.error('receipt queue job failed', error instanceof Error ? error.message : 'unknown error');
+        message.retry();
+      }
     }
-
-    await task;
-    return jsonResponse({ ok: true, receipt: true, accepted: true });
   }
 };
