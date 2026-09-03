@@ -14,12 +14,15 @@ function jsonResponse(data: unknown, status = 200): Response {
   });
 }
 
-function verifyBearerToken(request: Request, env: Env): boolean {
+function verifyBearerToken(request: Request, env: Env, includeSyncToken = false): boolean {
   const authHeader = request.headers.get('Authorization') || '';
   const token = authHeader.replace(/^Bearer\s+/i, '').trim();
-  const configured = env.WANXIANG_API_KEY || env.API_BEARER_TOKEN;
-  if (!configured) return false;
-  return token === configured;
+  const requestPath = new URL(request.url).pathname;
+  const syncTokenAllowed = includeSyncToken && requestPath.startsWith('/v1/sync/');
+  const configuredTokens = syncTokenAllowed
+    ? [env.OBSIDIAN_SYNC_API_KEY, env.WANXIANG_API_KEY, env.API_BEARER_TOKEN]
+    : [env.WANXIANG_API_KEY, env.API_BEARER_TOKEN];
+  return configuredTokens.filter((value): value is string => Boolean(value)).includes(token);
 }
 
 function getBearerOrSecret(env: Env): string | undefined {
@@ -75,7 +78,7 @@ export default {
 
     // 1. GET /v1/sync/list
     if (url.pathname === '/v1/sync/list' && method === 'GET') {
-      if (!verifyBearerToken(request, env)) {
+      if (!verifyBearerToken(request, env, true)) {
         return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
       }
       const includeDeleted = url.searchParams.get('include_deleted') === 'true';
@@ -85,7 +88,7 @@ export default {
 
     // 2. GET /v1/sync/metadata
     if (url.pathname === '/v1/sync/metadata' && method === 'GET') {
-      if (!verifyBearerToken(request, env)) {
+      if (!verifyBearerToken(request, env, true)) {
         return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
       }
       const pathParam = url.searchParams.get('path');
@@ -107,7 +110,7 @@ export default {
 
     // 3. GET /v1/sync/file
     if (url.pathname === '/v1/sync/file' && method === 'GET') {
-      if (!verifyBearerToken(request, env)) {
+      if (!verifyBearerToken(request, env, true)) {
         return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
       }
       const pathParam = url.searchParams.get('path');
@@ -144,7 +147,7 @@ export default {
 
     // 4. PUT /v1/sync/file (Upload / Update)
     if (url.pathname === '/v1/sync/file' && (method === 'PUT' || method === 'POST')) {
-      if (!verifyBearerToken(request, env)) {
+      if (!verifyBearerToken(request, env, true)) {
         return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
       }
 
@@ -262,7 +265,7 @@ export default {
 
     // 5. DELETE /v1/sync/file (Soft Delete / Tombstone)
     if (url.pathname === '/v1/sync/file' && method === 'DELETE') {
-      if (!verifyBearerToken(request, env)) {
+      if (!verifyBearerToken(request, env, true)) {
         return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
       }
 
@@ -304,7 +307,7 @@ export default {
 
     // 6. POST /v1/sync/restore (Restore Soft-Deleted File)
     if (url.pathname === '/v1/sync/restore' && method === 'POST') {
-      if (!verifyBearerToken(request, env)) {
+      if (!verifyBearerToken(request, env, true)) {
         return jsonResponse({ ok: false, error: 'UNAUTHORIZED' }, 401);
       }
 
