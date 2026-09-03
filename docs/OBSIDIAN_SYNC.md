@@ -58,7 +58,8 @@
 |---|---|
 | `OBSIDIAN_VAULT_PATH` | 本地 Vault 绝对路径 |
 | `WANXIANG_SERVER_URL` | Worker 地址（默认 `https://wanxiang-cloud-dev.mzer8-substracker.workers.dev`） |
-| `WANXIANG_API_KEY` | Bearer Token（与 Worker secret `WANXIANG_API_KEY` 一致） |
+| `WANXIANG_API_KEY` | 通用 Worker Bearer Token（与 Worker Secret `WANXIANG_API_KEY` 一致） |
+| `OBSIDIAN_SYNC_API_KEY` | 可选的专用同步 Bearer Token（与 Worker Secret 同名）；存在时同步 API 也接受它，避免替换原有 v0.1 账目凭据 |
 
 也可用 `--vault`、`--server`、`--token` 覆盖。绝对路径不写死在代码中。
 
@@ -90,7 +91,7 @@ npx tsx local/obsidian-sync/index.ts restore <file-path> [--dry-run] [--vault ..
 - **状态库损坏**：删除 `<vault>/.wanxiang-sync/sync-state.json` 后重新 `status`——云端与本地差异会重新完整列出，不会丢失任何一侧文件。
 - **整库重建**：新机器配置三个环境变量后，`pull` 即可从云端主库拉取全部文件。
 
-## 8. 已实测验证清单（2026-09-02，独立测试 Vault）
+## 8. 已实测验证清单（2026-09-03，独立测试 Vault）
 
 1. 本地新建 A.md → `push` → 云端存在（v1）✅
 2. 云端新建 B.md → `pull` → 本地出现 ✅

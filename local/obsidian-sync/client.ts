@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { fetch as undiciFetch, ProxyAgent } from 'undici';
+import { normalizeRelativePath } from '../../src/sync';
 
 export interface LocalSyncConfig {
   vaultPath: string;
@@ -43,10 +44,10 @@ export interface StateDatabase {
 }
 
 const IGNORED_PATTERNS = [
-  /^\.git(\/|\\|$)/,
-  /^\.obsidian(\/|\\)cache(\/|\\|$)/,
-  /^\.trash(\/|\\|$)/,
-  /^node_modules(\/|\\|$)/,
+  /(?:^|\/)\.git(?:\/|$)/,
+  /(?:^|\/)\.obsidian\/cache(?:\/|$)/,
+  /(?:^|\/)\.trash(?:\/|$)/,
+  /(?:^|\/)node_modules(?:\/|$)/,
   /\.DS_Store$/,
   /thumbs\.db$/i,
   /~$/,
@@ -83,7 +84,7 @@ export class ObsidianSyncClient {
       throw new Error(`Vault path does not exist: ${this.config.vaultPath}`);
     }
     const stateDir = path.join(this.config.vaultPath, '.wanxiang-sync');
-    if (!fs.existsSync(stateDir)) {
+    if (!this.config.dryRun && !fs.existsSync(stateDir)) {
       fs.mkdirSync(stateDir, { recursive: true });
     }
     this.stateFilePath = path.join(stateDir, 'sync-state.json');
@@ -95,6 +96,26 @@ export class ObsidianSyncClient {
         this.proxyDispatcher = new ProxyAgent(proxy);
       } catch {}
     }
+  }
+
+  private resolveLocalPath(relPath: string): { normalized: string; fullPath: string } {
+    let normalized: string;
+    try {
+      normalized = normalizeRelativePath(relPath);
+    } catch {
+      throw new Error('INVALID_PATH');
+    }
+    if (isIgnoredPath(normalized)) {
+      throw new Error('IGNORED_PATH');
+    }
+
+    const root = path.resolve(this.config.vaultPath);
+    const fullPath = path.resolve(root, normalized);
+    const relative = path.relative(root, fullPath);
+    if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+      throw new Error('INVALID_PATH');
+    }
+    return { normalized, fullPath };
   }
 
   private loadState(): StateDatabase {
@@ -128,8 +149,19 @@ export class ObsidianSyncClient {
       undiciOptions.dispatcher = this.proxyDispatcher;
     }
 
-    const res = await (undiciFetch as any)(url, undiciOptions);
-    return res as unknown as Response;
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 5; attempt++) {
+      try {
+        const res = await (undiciFetch as any)(url, undiciOptions);
+        return res as unknown as Response;
+      } catch (err: unknown) {
+        lastError = err;
+        if (attempt < 4) {
+          await new Promise(resolve => setTimeout(resolve, 1000 * (attempt + 1)));
+        }
+      }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
   }
 
   public scanLocalFiles(): Record<string, { fullPath: string; hash: string; size: number; mtime: string }> {
@@ -187,12 +219,10 @@ export class ObsidianSyncClient {
       const cloud = cloudFiles[relPath];
       const stateItem = this.state.files[relPath];
 
-      if (local && (!cloud || cloud.is_deleted === 1)) {
-        if (!stateItem) {
-          statuses.push({ path: relPath, state: 'local_only', localHash: local.hash });
-        } else {
-          statuses.push({ path: relPath, state: 'deleted_cloud', localHash: local.hash, detail: 'Deleted on cloud but present locally' });
-        }
+      if (local && cloud && cloud.is_deleted === 1) {
+        statuses.push({ path: relPath, state: 'deleted_cloud', localHash: local.hash, cloudHash: cloud.content_hash, cloudVersion: cloud.version, detail: 'Deleted on cloud but present locally' });
+      } else if (local && !cloud) {
+        statuses.push({ path: relPath, state: 'local_only', localHash: local.hash });
       } else if (!local && cloud && cloud.is_deleted === 0) {
         statuses.push({ path: relPath, state: 'cloud_only', cloudHash: cloud.content_hash, cloudVersion: cloud.version });
       } else if (local && cloud && cloud.is_deleted === 0) {
@@ -224,7 +254,14 @@ export class ObsidianSyncClient {
   }
 
   public async pushFile(relPath: string, options: { force?: boolean } = {}): Promise<{ success: boolean; message: string; version?: number }> {
-    const fullPath = path.join(this.config.vaultPath, relPath);
+    let normalizedPath: string;
+    let fullPath: string;
+    try {
+      ({ normalized: normalizedPath, fullPath } = this.resolveLocalPath(relPath));
+    } catch (err: unknown) {
+      return { success: false, message: err instanceof Error ? err.message : String(err) };
+    }
+
     if (!fs.existsSync(fullPath)) {
       return { success: false, message: 'Local file does not exist' };
     }
@@ -232,11 +269,11 @@ export class ObsidianSyncClient {
     const fileBuffer = fs.readFileSync(fullPath);
     const contentHash = computeBufferSha256(fileBuffer);
     const stats = fs.statSync(fullPath);
-    const stateItem = this.state.files[relPath];
+    const stateItem = this.state.files[normalizedPath];
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/octet-stream',
-      'X-Wanxiang-Path': relPath,
+      'X-Wanxiang-Path': normalizedPath,
       'X-Wanxiang-Modified-At': stats.mtime.toISOString(),
       'X-Wanxiang-Source': 'obsidian_sync'
     };
@@ -247,7 +284,7 @@ export class ObsidianSyncClient {
     }
 
     if (this.config.dryRun) {
-      return { success: true, message: `[DRY-RUN] Would upload ${relPath} (hash: ${contentHash.slice(0, 8)})` };
+      return { success: true, message: `[DRY-RUN] Would upload ${normalizedPath} (hash: ${contentHash.slice(0, 8)})` };
     }
 
     const res = await this.fetchApi('/v1/sync/file', {
@@ -268,19 +305,27 @@ export class ObsidianSyncClient {
     const resJson = (await res.json()) as { ok: boolean; data: { file: CloudFileMetadata } };
     const savedFile = resJson.data.file;
 
-    this.state.files[relPath] = {
-      path: relPath,
+    this.state.files[normalizedPath] = {
+      path: normalizedPath,
       lastSyncedHash: savedFile.content_hash,
       lastSyncedVersion: savedFile.version,
       lastSyncedAt: new Date().toISOString()
     };
     this.saveState();
 
-    return { success: true, message: `Uploaded ${relPath} (v${savedFile.version})`, version: savedFile.version };
+    return { success: true, message: `Uploaded ${normalizedPath} (v${savedFile.version})`, version: savedFile.version };
   }
 
   public async pullFile(relPath: string): Promise<{ success: boolean; message: string }> {
-    const res = await this.fetchApi(`/v1/sync/file?path=${encodeURIComponent(relPath)}`);
+    let normalizedPath: string;
+    let fullPath: string;
+    try {
+      ({ normalized: normalizedPath, fullPath } = this.resolveLocalPath(relPath));
+    } catch (err: unknown) {
+      return { success: false, message: err instanceof Error ? err.message : String(err) };
+    }
+
+    const res = await this.fetchApi(`/v1/sync/file?path=${encodeURIComponent(normalizedPath)}`);
     if (!res.ok) {
       return { success: false, message: `Download failed: ${res.status} ${await res.text()}` };
     }
@@ -290,10 +335,20 @@ export class ObsidianSyncClient {
     const versionStr = res.headers.get('X-Wanxiang-Version') || '1';
     const contentHash = res.headers.get('X-Wanxiang-Content-Hash') || computeBufferSha256(buffer);
 
-    const fullPath = path.join(this.config.vaultPath, relPath);
+    if (fs.existsSync(fullPath)) {
+      if (!fs.statSync(fullPath).isFile()) {
+        return { success: false, message: `Cannot download over non-file path: ${normalizedPath}` };
+      }
+      const localHash = computeFileSha256(fullPath);
+      const stateItem = this.state.files[normalizedPath];
+      const localChanged = !stateItem || stateItem.lastSyncedHash !== localHash;
+      if (localHash !== contentHash && localChanged) {
+        return { success: false, message: `CONFLICT: Local file differs from cloud ${normalizedPath}; refusing to overwrite` };
+      }
+    }
 
     if (this.config.dryRun) {
-      return { success: true, message: `[DRY-RUN] Would download ${relPath} (v${versionStr}) to local` };
+      return { success: true, message: `[DRY-RUN] Would download ${normalizedPath} (v${versionStr}) to local` };
     }
 
     const dir = path.dirname(fullPath);
@@ -303,23 +358,30 @@ export class ObsidianSyncClient {
 
     fs.writeFileSync(fullPath, buffer);
 
-    this.state.files[relPath] = {
-      path: relPath,
+    this.state.files[normalizedPath] = {
+      path: normalizedPath,
       lastSyncedHash: contentHash,
       lastSyncedVersion: parseInt(versionStr, 10),
       lastSyncedAt: new Date().toISOString()
     };
     this.saveState();
 
-    return { success: true, message: `Downloaded ${relPath} (v${versionStr})` };
+    return { success: true, message: `Downloaded ${normalizedPath} (v${versionStr})` };
   }
 
   public async deleteCloudFile(relPath: string): Promise<{ success: boolean; message: string }> {
-    if (this.config.dryRun) {
-      return { success: true, message: `[DRY-RUN] Would soft-delete ${relPath} on cloud` };
+    let normalizedPath: string;
+    try {
+      ({ normalized: normalizedPath } = this.resolveLocalPath(relPath));
+    } catch (err: unknown) {
+      return { success: false, message: err instanceof Error ? err.message : String(err) };
     }
 
-    const res = await this.fetchApi(`/v1/sync/file?path=${encodeURIComponent(relPath)}`, {
+    if (this.config.dryRun) {
+      return { success: true, message: `[DRY-RUN] Would soft-delete ${normalizedPath} on cloud` };
+    }
+
+    const res = await this.fetchApi(`/v1/sync/file?path=${encodeURIComponent(normalizedPath)}`, {
       method: 'DELETE'
     });
 
@@ -327,21 +389,37 @@ export class ObsidianSyncClient {
       return { success: false, message: `Delete failed: ${res.status} ${await res.text()}` };
     }
 
-    delete this.state.files[relPath];
-    this.saveState();
+    const resJson = await res.json() as { data?: { file?: CloudFileMetadata } };
+    const deletedFile = resJson.data?.file;
+    if (deletedFile) {
+      this.state.files[normalizedPath] = {
+        path: normalizedPath,
+        lastSyncedHash: deletedFile.content_hash,
+        lastSyncedVersion: deletedFile.version,
+        lastSyncedAt: new Date().toISOString()
+      };
+      this.saveState();
+    }
 
-    return { success: true, message: `Soft-deleted ${relPath} on cloud` };
+    return { success: true, message: `Soft-deleted ${normalizedPath} on cloud` };
   }
 
   public async restoreCloudFile(relPath: string): Promise<{ success: boolean; message: string }> {
+    let normalizedPath: string;
+    try {
+      ({ normalized: normalizedPath } = this.resolveLocalPath(relPath));
+    } catch (err: unknown) {
+      return { success: false, message: err instanceof Error ? err.message : String(err) };
+    }
+
     if (this.config.dryRun) {
-      return { success: true, message: `[DRY-RUN] Would restore ${relPath} on cloud` };
+      return { success: true, message: `[DRY-RUN] Would restore ${normalizedPath} on cloud` };
     }
 
     const res = await this.fetchApi('/v1/sync/restore', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ path: relPath })
+      body: JSON.stringify({ path: normalizedPath })
     });
 
     if (!res.ok) {
@@ -351,15 +429,15 @@ export class ObsidianSyncClient {
     const resJson = (await res.json()) as { ok: boolean; data: { file: CloudFileMetadata } };
     const restoredFile = resJson.data.file;
 
-    this.state.files[relPath] = {
-      path: relPath,
+    this.state.files[normalizedPath] = {
+      path: normalizedPath,
       lastSyncedHash: restoredFile.content_hash,
       lastSyncedVersion: restoredFile.version,
       lastSyncedAt: new Date().toISOString()
     };
     this.saveState();
 
-    return { success: true, message: `Restored ${relPath} (v${restoredFile.version}) on cloud` };
+    return { success: true, message: `Restored ${normalizedPath} (v${restoredFile.version}) on cloud` };
   }
 
   public async sync(): Promise<{ actions: string[]; conflicts: string[] }> {

@@ -19,7 +19,7 @@ Options:
   --dry-run            Simulate operations without writing/deleting any files
   --vault <path>       Specify local vault path (or set OBSIDIAN_VAULT_PATH env)
   --server <url>       Specify cloud server URL (or set WANXIANG_SERVER_URL env)
-  --token <token>      Specify API Bearer token (or set WANXIANG_API_KEY env)
+  --token <token>      Specify API Bearer token (or set OBSIDIAN_SYNC_API_KEY/WANXIANG_API_KEY env)
   --force              Force upload even if base version differs
   --help, -h           Show this help message
 `);
@@ -43,7 +43,7 @@ async function main(): Promise<void> {
 
   const vaultPath = getArgValue('--vault') || process.env.OBSIDIAN_VAULT_PATH || process.env.VAULT_PATH;
   const serverUrl = getArgValue('--server') || process.env.WANXIANG_SERVER_URL || 'https://wanxiang-cloud-dev.mzer8-substracker.workers.dev';
-  const apiKey = getArgValue('--token') || process.env.WANXIANG_API_KEY || process.env.API_BEARER_TOKEN;
+  const apiKey = getArgValue('--token') || process.env.OBSIDIAN_SYNC_API_KEY || process.env.WANXIANG_API_KEY || process.env.API_BEARER_TOKEN;
 
   if (!vaultPath) {
     console.error('Error: Vault path is required. Provide --vault <path> or set OBSIDIAN_VAULT_PATH.');
@@ -134,6 +134,7 @@ async function main(): Promise<void> {
           }
         }
         console.log(`\nFinished: ${res.actions.length} action(s), ${res.conflicts.length} conflict(s).`);
+        if (res.conflicts.length > 0) process.exitCode = 2;
         break;
       }
 
