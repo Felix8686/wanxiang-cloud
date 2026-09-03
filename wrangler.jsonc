@@ -1,14 +1,15 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "wanxiang-cloud-dev",
-  "main": "src/index.ts",
+  "main": "src/app.ts",
   "compatibility_date": "2026-09-01",
   "observability": {
     "enabled": true
   },
   "vars": {
     "APP_TIMEZONE": "Asia/Shanghai",
-    "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+    "AI_MODEL": "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+    "RECEIPT_VISION_MODEL": "@cf/qwen/qwen3.8-27b"
   },
   "ai": {
     "binding": "AI"
@@ -26,6 +27,21 @@
       "binding": "FILES",
       "bucket_name": "wanxiang-cloud-dev-files"
     }
-  ]
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "RECEIPT_QUEUE",
+        "queue": "wanxiang-receipt-dev"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "wanxiang-receipt-dev",
+        "max_batch_size": 1,
+        "max_batch_timeout": 1,
+        "max_retries": 2
+      }
+    ]
+  }
 }
-

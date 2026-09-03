@@ -1,0 +1,108 @@
+Wanxiang Cloud v0.3 Hermes Validation Handoff
+
+Repository:
+https://github.com/Felix8686/wanxiang-cloud
+
+Branch:
+dev/v0.3-receipt-vision
+
+ROLE BOUNDARY
+
+This v0.3 code is designed and implemented in GitHub by ChatGPT.
+Hermes is the deployment/debug/validation executor only.
+Do not redesign or broadly rewrite business logic. If code fails, collect exact evidence and report it to ChatGPT.
+
+DO NOT:
+- modify main;
+- merge Draft PR #4;
+- build v0.4;
+- rotate or print existing secrets;
+- persist receipt photos;
+- rewrite v0.1/v0.2 logic.
+
+CURRENT ARCHITECTURE
+
+Telegram webhook
+-> Cloudflare Queue wanxiang-receipt-dev
+-> Queue consumer
+-> Telegram getFile/download
+-> Workers AI Vision
+-> validation/reconciliation
+-> D1 transaction + transaction_items
+-> Telegram final reply
+
+Current health version after the rotated-receipt fix:
+0.3.2
+
+CURRENT REAL-WORLD FIX
+
+A real Telegram photo was visibly a shopping receipt but was photographed sideways, occupied only part of the frame, and included fingers/background. The prior classifier returned is_receipt=false.
+
+The code now treats these as normal user conditions:
+- 90/180/270 degree rotation;
+- tilted/perspective photos;
+- receipt occupying only part of the image;
+- fingers, desk/carpet/background clutter;
+- folds, shadows and imperfect framing.
+
+If the first Vision pass returns is_receipt=false, the Worker automatically performs one second verification pass on the same downloaded image. The user must NOT be asked to resend between those two passes.
+
+The second pass explicitly checks all four orientations and looks for receipt evidence such as narrow thermal paper, item/quantity/price rows, totals, payment details, merchant/time or barcode. Only if both passes reject the image should it be treated as a non-receipt.
+
+The same safety rules remain: successful recognition still must pass confidence and amount reconciliation before any transaction is written.
+
+PRE-DEPLOY
+
+1. git fetch/pull.
+2. checkout dev/v0.3-receipt-vision.
+3. confirm HEAD matches origin branch and worktree is clean.
+4. npm install.
+5. npm run typecheck.
+6. npm run test:receipt.
+7. npx wrangler deploy --dry-run.
+
+If any step fails, STOP and report exact output to ChatGPT. Do not repair business code yourself.
+
+DEPLOY
+
+Queue wanxiang-receipt-dev already exists. Do not recreate it.
+Deploy only wanxiang-cloud-dev.
+Do not alter any Secret, D1 schema or Queue settings.
+
+POST-DEPLOY
+
+GET /health must return HTTP 200 and show:
+- version 0.3.2
+- receipt_vision=true
+- receipt_queue_bound=true
+- receipt vision model configured
+- D1/R2 bindings present
+
+REAL E2E
+
+After deployment notify the user once:
+
+“横拍小票容错版已部署，请把刚才那张小票再发送一次。”
+
+The user should only need to resend once for this build.
+
+Validate:
+1. Telegram acknowledgement is received.
+2. ingestion_log moves queued -> processing -> parsed/rejected/failed.
+3. If first pass rejects, verify the automatic second-pass path is triggered (log: receipt vision retry with reason first_pass_not_receipt).
+4. No second user resend is requested for the fallback pass.
+5. Successful receipt creates transactions +1 and transaction_items +N only after confidence and reconciliation pass.
+6. Final Telegram response contains receipt summary.
+7. The real receipt photo is not persisted to R2/D1/Git.
+
+If this build still fails, DO NOT ask the user to keep resending images. Collect the existing run evidence and return it to ChatGPT first:
+- source_id;
+- final status;
+- error_message;
+- whether receipt vision retry occurred;
+- safe AI response-shape log if present;
+- Worker/Queue error only;
+- transactions/items counts;
+- Telegram replies.
+
+Do not modify main and do not merge PR #4.
