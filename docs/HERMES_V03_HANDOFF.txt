@@ -8,173 +8,167 @@ dev/v0.3-receipt-vision
 
 ROLE BOUNDARY
 
-This v0.3 code has already been designed and implemented in GitHub.
-Hermes is NOT the feature designer or primary coder for this phase.
-Hermes responsibilities are limited to:
-- pull the existing branch;
-- install dependencies;
-- run TypeScript/tests;
-- apply the new D1 migration in the dev environment;
-- deploy the dev Worker;
-- perform isolated and real Telegram E2E validation;
-- diagnose failures and report exact evidence.
-
-If a business-logic/code defect is found, do not redesign or broadly rewrite the implementation. Report the defect, file/line area, reproduction steps, logs/errors, and the smallest suggested fix back to the user for ChatGPT to implement. Only environment-specific, non-code adjustments needed for testing are allowed without code changes.
+This v0.3 code is designed and implemented in GitHub by ChatGPT.
+Hermes is the deployment/debug/validation executor only.
+Do not redesign or broadly rewrite business logic. If code fails, collect exact evidence and report it to ChatGPT.
 
 DO NOT:
 - modify main;
-- merge the Draft PR;
+- merge Draft PR #4;
 - build v0.4;
 - rotate or print existing secrets;
 - persist receipt photos;
-- delete existing real transactions;
-- rewrite v0.1/v0.2 logic;
-- substitute a different architecture on your own.
+- rewrite v0.1/v0.2 logic.
 
-CURRENT DESIGN
+IMPORTANT FIX: WAITUNTIL -> CLOUDFLARE QUEUE
 
-Entry point:
+The first real receipt reached D1 but remained status=processing because the old implementation ran Vision inside HTTP ctx.waitUntil(). Cloudflare cancels HTTP waitUntil work after 30 seconds after the response ends. Vision can exceed that window, leaving the processing marker without a terminal update.
+
+The branch now uses:
+
+Telegram webhook
+-> enqueue wanxiang-receipt-dev
+-> immediate Telegram acknowledgement
+-> Cloudflare Queue consumer
+-> Telegram getFile/download
+-> Workers AI Vision
+-> validation/reconciliation
+-> D1 transaction + transaction_items
+-> final Telegram reply
+
+Queue consumer jobs have a much longer execution window than HTTP waitUntil. The code also adds:
+- 30 second Telegram download timeout;
+- 120 second Vision timeout;
+- failed/rejected terminal status on timeout/error;
+- stale processing recovery after 240 seconds;
+- ownership check before D1 write;
+- retrying the same photo after a failed/stale attempt without duplicate transaction creation.
+
+CURRENT FILES
+
+HTTP + Queue entry point:
 src/app.ts
 
-Legacy/core APIs and text Telegram messages are delegated to:
-src/index.ts
+Durable receipt job orchestration:
+src/receipt-job.ts
 
-Receipt pipeline:
+Vision/OCR/reconciliation primitives:
 src/receipt.ts
 
-Migration:
+Migration already applied:
 migrations/0003_transaction_items.sql
 
 Vision model default:
 @cf/google/gemma-4-26b-a4b-it
 
-Wrangler variable:
-RECEIPT_VISION_MODEL
+Queue name:
+wanxiang-receipt-dev
 
-R2 is NOT used to store receipt photos.
+Queue binding:
+RECEIPT_QUEUE
 
-PRE-DEPLOY CHECKS
+PRE-DEPLOY
 
-1. git status must be clean after checkout.
-2. branch must be dev/v0.3-receipt-vision.
-3. npm install.
-4. npx tsc --noEmit.
-5. npm run test:receipt.
-6. wrangler deploy --dry-run (or equivalent safe build check).
+1. git fetch/pull.
+2. checkout dev/v0.3-receipt-vision.
+3. confirm HEAD matches origin branch and worktree is clean.
+4. npm install.
+5. npx tsc --noEmit.
+6. npm run test:receipt.
+7. npx wrangler deploy --dry-run.
 
-If TypeScript/test/build fails, stop before remote migration/deploy and report evidence.
+If any of steps 4-7 fails, STOP and report exact output to ChatGPT. Do not repair business code yourself.
 
-D1 MIGRATION
+QUEUE RESOURCE
 
-Apply only the new migration through the normal migration mechanism.
-Do not edit or re-run migration files manually.
-Do not modify 0001_init.sql or 0002_sync_metadata.sql.
+Check whether Cloudflare Queue wanxiang-receipt-dev exists.
 
-Verify transaction_items exists with:
-- transaction_id FK;
-- quantity REAL;
-- unit_price_fen nullable integer;
-- line_total_fen integer;
-- category;
-- confidence.
+If it does not exist, create exactly this one resource:
 
-Before/after migration record current transactions count. Existing real transactions must remain unchanged.
+npx wrangler queues create wanxiang-receipt-dev
 
-DEV DEPLOY
+This is authorized deployment infrastructure for v0.3. Do not create other queues.
 
-Deploy only wanxiang-cloud-dev from this branch.
-Do not create a production Worker.
-Do not rotate:
-- WANXIANG_API_KEY
-- API_BEARER_TOKEN
-- OBSIDIAN_SYNC_API_KEY
-- TELEGRAM_BOT_TOKEN
-- TELEGRAM_WEBHOOK_SECRET
+Then deploy only:
+wanxiang-cloud-dev
 
-Verify /health reports:
-- version 0.3.0
-- receipt_vision true
-- configured receipt vision model
-- D1/R2 bindings present.
+Wrangler config already defines both producer binding and consumer for wanxiang-receipt-dev.
 
-ISOLATED VALIDATION
+Do not alter any Secret.
 
-Use controlled fixtures before asking the user for a real receipt.
-Do not use the user's real receipt as the first test.
+POST-DEPLOY HEALTH
 
-Required cases:
+GET /health must return HTTP 200 and show:
+- version 0.3.1
+- receipt_vision=true
+- receipt_queue_bound=true
+- receipt vision model configured
+- D1/R2 bindings present
 
-1. Existing text Telegram path
-Input: 晚饭25元，支付宝
-Expected: legacy flow still works.
-Clean up only the exact synthetic test transaction afterward.
+Verify text Telegram webhook Secret checks still return 401 for missing/wrong secret.
 
-2. Existing query path
-Input: 今天花了多少
-Expected: legacy query still works and creates no transaction.
+ABANDONED FIRST RECEIPT
 
-3. Clear receipt image
-Expected:
-- Telegram getFile/download succeeds;
-- Vision returns is_receipt=true;
-- transaction + transaction_items written;
-- item/category values plausible;
-- amount reconciliation passes.
+The earlier real receipt attempt has source_id:
+receipt_1118263109_AQADeRVrG5iMyVR-
 
-4. Multi-category receipt
-Expected different item categories, not one category for the entire receipt.
+It is an abandoned pre-queue attempt and cannot resume because the original Telegram update/file_id is no longer available to the Worker.
 
-5. Amount mismatch fixture
-Expected no transaction write and a Telegram failure message.
+After the new Queue version is successfully deployed, perform exactly this one D1 repair:
 
-6. Non-receipt image
-Expected no transaction write.
+UPDATE ingestion_log
+SET status = 'failed',
+    error_message = 'ABANDONED_PRE_QUEUE_WAITUNTIL_ATTEMPT'
+WHERE source = 'telegram'
+  AND source_id = 'receipt_1118263109_AQADeRVrG5iMyVR-'
+  AND status = 'processing';
 
-7. Duplicate photo
-Send/replay the same Telegram file_unique_id.
-Expected no duplicate transaction.
+Then read it back and confirm status=failed.
 
-8. Large/invalid image/download failure
-Expected safe failure, no transaction.
+Do not delete this row. Preserve it as failure evidence.
 
-9. Privacy
-Confirm no receipt image object appears in R2 and no file URL/token is stored in D1/Git/log output.
+Do not modify any other ingestion row.
 
-After isolated testing, remove only clearly identified synthetic test transactions/items/ingestion fixtures. Do not touch real user data.
+REAL E2E
 
-REAL TELEGRAM E2E
+After deployment and the one-row repair, notify the user:
 
-Only after all isolated validation passes, ask the user to send one real supermarket receipt photo from their Telegram client.
+“队列版已部署，请把刚才那张真实小票重新发送一次。”
 
-Validate the real chain:
-Telegram photo
--> webhook 200/accepted
--> Telegram getFile
--> image download
--> Workers AI Vision
--> structured receipt
--> reconciliation
--> transactions + transaction_items
--> Telegram summary reply
+The same photo is allowed. The new code permits a failed/stale receipt source_id to be retried safely.
 
-The user's real receipt is real accounting data. Do NOT delete it unless explicitly instructed.
+Validate:
+1. Telegram first replies: 已收到小票，正在识别。
+2. ingestion_log moves queued -> processing -> parsed/rejected/failed.
+3. No receipt remains processing for more than 240 seconds.
+4. getFile/download succeeds or ends as failed with a concrete error.
+5. Workers AI Vision returns or ends as failed with RECEIPT_AI_TIMEOUT within 120 seconds.
+6. Successful receipt creates transactions +1 and transaction_items +N.
+7. Amount reconciliation passes before transaction write.
+8. Final Telegram reply contains receipt summary.
+9. Resending the same successfully-recorded photo does not create a second transaction.
+10. Original receipt photo is not stored in R2/D1/Git.
 
-REPORT BACK
+CURRENT DATA BASELINE
 
-Return concise evidence:
-1. TypeScript PASS/FAIL
-2. npm run test:receipt PASS/FAIL
-3. migration PASS/FAIL
-4. dev deploy PASS/FAIL
-5. actual vision model call PASS/FAIL
-6. Chinese receipt OCR result quality
-7. item extraction PASS/FAIL
-8. multi-category classification PASS/FAIL
-9. reconciliation PASS/FAIL
-10. non-receipt rejection PASS/FAIL
-11. duplicate-image idempotency PASS/FAIL
-12. legacy text/query regression PASS/FAIL
-13. real Telegram receipt E2E PASS/FAIL
-14. transaction/items counts before/after
-15. exact defects found, without broad code rewrites
-16. confirm main not modified and PR not merged
+The user intentionally cleared prior synthetic/test transactions. transactions=0 before the next real receipt is expected and is NOT a data-loss incident.
+
+If the resent real receipt succeeds, it becomes real user accounting data. Do not delete it unless explicitly instructed.
+
+FAILURE REPORT
+
+If E2E fails, report only evidence:
+- current branch/HEAD;
+- Worker version;
+- Queue creation/binding/consumer status;
+- /health output;
+- source_id;
+- ingestion status transitions;
+- ingestion error_message;
+- D1 transaction/items counts;
+- Telegram replies;
+- relevant Wrangler/Worker/Queue error output;
+- suspected file/function;
+- smallest suggested code fix.
+
+Do not modify main and do not merge PR #4.
