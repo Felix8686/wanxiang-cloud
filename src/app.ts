@@ -1,6 +1,8 @@
 import coreHandler from './index';
 import { selectLargestPhoto } from './receipt';
-import { enqueueReceiptJob, processReceiptQueueJob } from './receipt-job';
+import { enqueueReceiptJob } from './receipt-job';
+import { processReceiptQueueJobV2 } from './receipt-job-v2';
+import { isVeryfiConfigured } from './receipt-provider';
 import type { Env, TelegramUpdate } from './types';
 import type { ReceiptQueueJob } from './receipt-job';
 
@@ -64,10 +66,11 @@ export default {
       return jsonResponse({
         ok: true,
         service: 'wanxiang-cloud',
-        version: '0.3.3',
+        version: '0.3.4',
         receipt_vision: true,
+        receipt_provider: 'veryfi',
+        receipt_provider_configured: isVeryfiConfigured(env),
         receipt_queue_bound: !!env.RECEIPT_QUEUE,
-        receipt_vision_model: env.RECEIPT_VISION_MODEL || '@cf/google/gemma-4-26b-a4b-it',
         r2_bound: !!env.FILES,
         d1_bound: !!env.DB
       });
@@ -131,7 +134,7 @@ export default {
     for (const message of batch.messages) {
       const job = message.body;
       try {
-        const result = await processReceiptQueueJob(env, job);
+        const result = await processReceiptQueueJobV2(env, job);
         await sendTelegramMessage(env, job.chatId, result.message);
         message.ack();
       } catch (error) {
