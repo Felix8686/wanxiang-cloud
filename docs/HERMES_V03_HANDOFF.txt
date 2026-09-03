@@ -73,7 +73,7 @@ PRE-DEPLOY
 2. checkout dev/v0.3-receipt-vision.
 3. confirm HEAD matches origin branch and worktree is clean.
 4. npm install.
-5. npx tsc --noEmit.
+5. npm run typecheck.
 6. npm run test:receipt.
 7. npx wrangler deploy --dry-run.
 
@@ -126,7 +126,6 @@ WHERE source = 'telegram'
 Then read it back and confirm status=failed.
 
 Do not delete this row. Preserve it as failure evidence.
-
 Do not modify any other ingestion row.
 
 REAL E2E
