@@ -49,15 +49,19 @@ async function handleReceiptPhoto(
     caption: string;
   }
 ): Promise<void> {
-  const result = await processTelegramReceipt(env, {
-    ...input,
-    localNow: getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai')
-  });
-
   try {
+    const result = await processTelegramReceipt(env, {
+      ...input,
+      localNow: getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai')
+    });
     await sendTelegramMessage(env, input.chatId, result.message);
   } catch (error) {
-    console.error('telegram receipt reply failed', error instanceof Error ? error.message : 'unknown error');
+    console.error('telegram receipt background task failed', error instanceof Error ? error.message : 'unknown error');
+    try {
+      await sendTelegramMessage(env, input.chatId, '小票处理失败，数据未写入。请稍后重新发送。');
+    } catch (replyError) {
+      console.error('telegram receipt error reply failed', replyError instanceof Error ? replyError.message : 'unknown error');
+    }
   }
 }
 
