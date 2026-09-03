@@ -4,80 +4,191 @@
 
 用户在 Telegram 中直接发送购物小票照片。万象云端在 Cloudflare 内完成图片下载、视觉识别、逐商品分类、金额核对和 D1 入账，不依赖本机 Hermes 常驻。
 
-## 链路
+## 当前链路（v0.3.1）
 
 ```text
 Telegram photo
   -> /telegram/webhook
+  -> verify webhook secret
+  -> select largest PhotoSize
+  -> Cloudflare Queue: wanxiang-receipt-dev
+  -> immediate Telegram acknowledgement
+
+Queue consumer
   -> Telegram getFile / file download
   -> Workers AI Vision
   -> Worker 结构校验
+  -> confidence checks
   -> 金额 reconciliation
   -> D1 transactions + transaction_items
-  -> Telegram 摘要回复
+  -> Telegram 最终摘要回复
 ```
 
-原有纯文字 Telegram 消息继续委托给 `src/index.ts`，v0.3 入口层为 `src/app.ts`，避免改写已经稳定的 v0.1/v0.2 核心逻辑。
+原有纯文字 Telegram 消息继续委托给 `src/index.ts`。v0.3 HTTP/Queue 入口层为 `src/app.ts`，小票异步任务编排为 `src/receipt-job.ts`，Vision/OCR 和金额核对基础逻辑在 `src/receipt.ts`。
 
-## 视觉模型
+## 为什么改用 Queue
 
-默认：`@cf/google/gemma-4-26b-a4b-it`
+第一张真实小票暴露了旧实现的问题：Webhook 先把 `ingestion_log` 写成 `processing`，随后把整个 Vision 任务放入 HTTP `ctx.waitUntil()`。Cloudflare HTTP `waitUntil()` 在响应结束后只有 30 秒延长期，超过后未完成任务会被取消，因此出现了 `processing` 永久无终态。
 
-配置变量：`RECEIPT_VISION_MODEL`
+v0.3.1 将长任务移入 Cloudflare Queues。Queue consumer 有更长执行窗口，适合 Telegram 下载 + Vision OCR 这类可能超过 30 秒的异步工作。
 
-选择原则：Cloudflare-hosted、支持 Vision、多语言文档理解，并保持较低推理成本。模型不是硬编码到业务逻辑中，可在实测发现中文小票效果不足时通过 Wrangler 变量替换。
+## Cloudflare 资源
 
-图片输入使用 Workers AI 支持的 multimodal message：`image_url` + data URI。图片只在当前 Worker 请求/后台任务生命周期内保留，不写 R2、不写 Git、不保存 Telegram file URL。
+现有：
+
+- Worker：`wanxiang-cloud-dev`
+- D1：`wanxiang-cloud-dev`
+- Workers AI binding：`AI`
+- R2 binding：`FILES`（小票照片不存 R2）
+
+新增：
+
+- Queue：`wanxiang-receipt-dev`
+- Producer binding：`RECEIPT_QUEUE`
+- Consumer：同一个 `wanxiang-cloud-dev` Worker
+- `max_batch_size=1`
+- `max_batch_timeout=1`
+- `max_retries=2`
+
+## Vision 模型
+
+默认：
+
+```text
+@cf/google/gemma-4-26b-a4b-it
+```
+
+通过：
+
+```text
+RECEIPT_VISION_MODEL
+```
+
+配置。
+
+模型只负责识别和返回结构化数据，不直接写数据库。最终入账由 Worker 校验后执行。
 
 ## Telegram 图片处理
 
-1. 从 `message.photo` 中选择分辨率最大的 `PhotoSize`。
-2. 使用 `file_id` 调用 Telegram `getFile`。
-3. 下载实际图片。
-4. 最大允许 8 MiB，避免 base64 后超过多模态请求的合理尺寸。
-5. `caption` 会作为用户补充说明一起交给视觉解析器。
-6. 视觉处理通过 `waitUntil()` 后台执行，Webhook 可以尽快返回 200，降低 Telegram 因视觉推理耗时而重试的概率。
+Webhook 支持 `message.photo`：
 
-### 幂等
+1. 选择 Telegram 返回的最大尺寸 `PhotoSize`；
+2. 使用现有 `TELEGRAM_BOT_TOKEN` 调用 `getFile`；
+3. 下载 Telegram 压缩后的图片；
+4. 超过大小限制安全拒绝；
+5. 图片进入 Workers AI Vision；
+6. 原图不写入 R2、D1、Git 或本地磁盘；
+7. `file_id` / Telegram file URL 不长期保存。
 
-同一图片使用稳定 source id：
+如果消息带 caption，例如：
 
 ```text
-receipt_<chat_id>_<file_unique_id>
+今天在永辉买的，支付宝
 ```
 
-如果 `file_unique_id` 不存在，才退回 message/update id。
+会作为附加上下文交给 Vision 层，并可作为有限长度 `raw_text` 保存。
 
-因此 Telegram webhook 重试、或同一用户再次发送完全相同的 Telegram 图片，都不会重复创建 transaction。
+## 任务状态机
 
-`ingestion_log` 同时作为处理锁：状态可为 `processing` / `parsed` / `rejected` / `failed`。
+小票任务通过 `ingestion_log.status` 表示：
 
-## 数据模型
+```text
+queued
+  -> processing
+      -> parsed
+      -> rejected
+      -> failed
+```
 
-Migration：`migrations/0003_transaction_items.sql`
+定义：
 
-一张成功小票对应：
+- `queued`：任务已成功写入 Cloudflare Queue；
+- `processing`：Queue consumer 已取得处理锁；
+- `parsed`：transaction + items 成功写入；
+- `rejected`：非小票、置信度不足或金额核对失败；
+- `failed`：下载、模型、超时或基础设施错误。
 
-- `transactions`：1 条总交易
-- `transaction_items`：N 条商品明细
+任何真实任务都不应长期停留在 `processing`。
 
-`transaction_items`：
+### 超时
 
-- `id`
-- `transaction_id`（FK -> transactions，ON DELETE CASCADE）
-- `name`
-- `quantity`（REAL，支持称重）
-- `unit_price_fen`（可空）
-- `line_total_fen`
-- `category`
-- `confidence`
-- `created_at`
+- Telegram 图片下载：30 秒；
+- Workers AI Vision：120 秒；
+- `processing` 超过 240 秒视为 stale。
 
-金额继续使用“分”落库，避免浮点污染。
+下载或 AI 超时必须进入 `failed`，且不得创建 transaction。
+
+### stale 恢复
+
+同一张小票此前如果处于：
+
+- `failed`
+- `rejected`
+- stale `processing`
+
+用户重新发送时允许安全重新处理。
+
+如果已经成功 `parsed`，则继续执行幂等保护，不允许重复交易。
+
+## 幂等
+
+小票 `source_id` 主要由：
+
+```text
+receipt_<chatId>_<file_unique_id>
+```
+
+生成。
+
+用于防止：
+
+- Telegram webhook 重试；
+- Queue 至少一次投递造成重复；
+- 用户重复发送已经成功入账的同一图片。
+
+正式写 D1 前，consumer 还会验证自己仍持有 processing lock。
+
+现有数据库：
+
+```text
+UNIQUE(source, source_id)
+```
+
+继续作为最后一道重复交易保护。
+
+## AI 结构化输出
+
+Receipt：
+
+```text
+merchant
+occurred_at
+currency
+total_amount
+subtotal_amount
+discount_amount
+tax_amount
+rounding_amount
+payment_method
+confidence
+total_confidence
+items[]
+```
+
+Item：
+
+```text
+name
+quantity
+unit_price
+line_total
+category
+confidence
+```
 
 ## 商品分类
 
-v0.3 明细分类固定为：
+允许：
 
 - 食品
 - 饮料
@@ -94,78 +205,95 @@ v0.3 明细分类固定为：
 - 服饰
 - 其他
 
-顶层 `transactions.category_id` 为兼容旧统计使用聚合映射：
+商品明细分类与现有交易顶层分类并存。
 
-- 食品/饮料/生鲜/零食 -> 餐饮
-- 日用品/清洁用品/个护/家居 -> 日用品
-- 其他类别 -> 其他支出
+## D1 模型
 
-按明细金额占比最大的组确定顶层分类。精细统计以后应直接查询 `transaction_items.category`。
+Migration：
+
+```text
+migrations/0003_transaction_items.sql
+```
+
+一张小票：
+
+```text
+transactions: 1 行
+transaction_items: N 行
+```
+
+`transaction_items`：
+
+```text
+id
+transaction_id
+name
+quantity
+unit_price_fen
+line_total_fen
+category
+confidence
+created_at
+```
 
 ## 金额核对
-
-视觉模型必须拆分：
-
-- `items[].line_total`
-- `discount_amount`（正数，表示优惠减少）
-- `tax_amount`
-- `rounding_amount`（可正可负）
-- `total_amount`
 
 Worker 计算：
 
 ```text
-expected_total = sum(items.line_total)
-               - discount
-               + tax
-               + rounding
+sum(item.line_total)
+- discount
++ tax
++ rounding
 ```
 
-与小票总额的误差最多允许 2 分。
+与 `receipt.total_amount` 比较。
 
-超过误差：拒绝入账，并提示用户重新拍完整/清晰小票。
+允许误差：
 
-## 置信度安全门
+```text
+<= 2 分
+```
 
-自动入账要求：
+超过误差：
 
-- 整张小票 confidence >= 0.80
-- 总金额 total_confidence >= 0.90
-- 低于 0.55 的商品行不得超过全部商品的 25%
-- 商品行数量 1-200
-- 总金额 > 0
+- 不创建 transaction；
+- 不创建 transaction_items；
+- ingestion -> `rejected`；
+- Telegram 提示重新拍摄/确认。
 
-不满足时只返回失败提示，不创建 `transactions` 或 `transaction_items`。
+## 置信度门槛
 
-普通图片必须输出 `is_receipt=false`，不会入账。
+当前 MVP：
 
-## 支付账户
+- receipt confidence >= 0.80
+- total confidence >= 0.90
+- item 低置信阈值 = 0.55
+- 低置信商品最多占 25%
 
-视觉结果中的 `payment_method` 会尝试匹配已有 `accounts`：
+识别不确定时默认拒绝自动入账。
 
-- 支付宝
-- 微信
-- 现金
-- 或完整支付方式文本
+## 非小票图片
 
-找不到已有账户时使用 `account-unspecified`，不会在视觉识别阶段擅自创建新账户。
+Vision prompt 要求区分购物小票与：
 
-## 隐私
+- 普通照片
+- 截图
+- 商品包装
+- 菜单
+- 无关文档
 
-默认不永久保存原始小票图片：
+非小票图片不得创建交易。
 
-- 不写 R2
-- 不写 D1
-- 不写本地磁盘
-- 不写 Git
-- 不保存 Telegram file URL
-- 不保存完整 OCR 原文
+## Telegram 交互
 
-`transactions.raw_text` 对图片消息只保存用户主动填写的 caption（如有）。
+新任务首先回复：
 
-## Telegram 成功回复
+```text
+已收到小票，正在识别。
+```
 
-示例：
+成功后再回复摘要，例如：
 
 ```text
 已识别并记录购物小票
@@ -182,24 +310,61 @@ expected_total = sum(items.line_total)
 其他 ¥34.70
 ```
 
-## MVP 限制
+超时/失败也必须返回终态，不允许静默卡在 processing。
 
-- 一次 Telegram message 处理一张图片；暂不把多张长小票照片自动拼接为同一张小票。
-- 暂无按钮式逐行人工校对 UI。
-- 图片模糊、反光、折叠、金额缺失时优先拒绝自动入账。
-- 不永久保存原始小票，因此发生识别争议时需要用户重新发送照片。
-- 视觉模型的真实中文小票效果必须由 Hermes 在 Cloudflare dev 环境和用户真实 Telegram 小票上继续验收。
+## 隐私
 
-## Hermes 验收重点
+- 原始小票照片不持久化；
+- 不写 R2；
+- Telegram file URL 不持久化；
+- Bot Token 只保留在 Cloudflare Secret；
+- D1 只保留结构化账目以及可选 caption。
 
-Hermes 只负责部署/调试/反馈，不负责重新设计业务逻辑。必须验证：
+## 原功能保护
 
-1. `0003_transaction_items.sql` 远程 migration。
-2. Gemma 4 Vision 在当前 Cloudflare 账户可调用。
-3. 中文超市小票逐行 OCR。
-4. 多类别分类。
-5. 金额核对通过/失败两条路径。
-6. 普通图片拒绝。
-7. 同一图片重复发送幂等。
-8. 原文字记账和 Obsidian sync 回归。
-9. 用户本人真实 Telegram 小票 E2E。
+以下继续走旧链路：
+
+```text
+晚饭25元，支付宝
+今天花了多少
+/v1/intake
+/v1/sync/*
+```
+
+## 真实 E2E 验收
+
+必须证明：
+
+1. Telegram webhook 正常；
+2. Queue enqueue 成功；
+3. `queued -> processing -> terminal`；
+4. Telegram `getFile` 成功；
+5. Workers AI Vision 在配置超时内结束；
+6. 中文小票字段和商品行可识别；
+7. 商品逐项分类合理；
+8. 金额核对通过；
+9. `transactions +1`；
+10. `transaction_items +N`；
+11. Telegram 收到最终摘要；
+12. 重发同一张已成功小票不重复入账；
+13. R2 中没有原始小票图片。
+
+## 第一张真实小票事故记录
+
+第一张真实 v0.3 小票曾产生：
+
+```text
+source_id=receipt_1118263109_AQADeRVrG5iMyVR-
+status=processing
+```
+
+旧版使用 `waitUntil()`，任务被生命周期限制中断，因此没有终态。
+
+部署 Queue 修复后，这条历史记录应保留并标记：
+
+```text
+status=failed
+error_message=ABANDONED_PRE_QUEUE_WAITUNTIL_ATTEMPT
+```
+
+不要删除它，也不要把它当作成功交易。
