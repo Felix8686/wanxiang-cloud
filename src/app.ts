@@ -1,6 +1,10 @@
 import coreHandler from './index';
 import { processTelegramReceipt, selectLargestPhoto } from './receipt';
-import type { Env, TelegramUpdate } from './types';
+import type { Env, TelegramUpdate, TelegramPhotoSize } from './types';
+
+interface ExecutionContextLike {
+  waitUntil(promise: Promise<unknown>): void;
+}
 
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -35,8 +39,30 @@ async function sendTelegramMessage(env: Env, chatId: number, text: string): Prom
   if (!response.ok) throw new Error(`TELEGRAM_SEND_HTTP_${response.status}`);
 }
 
+async function handleReceiptPhoto(
+  env: Env,
+  input: {
+    chatId: number;
+    messageId: number;
+    updateId: number;
+    photo: TelegramPhotoSize;
+    caption: string;
+  }
+): Promise<void> {
+  const result = await processTelegramReceipt(env, {
+    ...input,
+    localNow: getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai')
+  });
+
+  try {
+    await sendTelegramMessage(env, input.chatId, result.message);
+  } catch (error) {
+    console.error('telegram receipt reply failed', error instanceof Error ? error.message : 'unknown error');
+  }
+}
+
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, ctx?: ExecutionContextLike): Promise<Response> {
     const url = new URL(request.url);
     const method = request.method.toUpperCase();
 
@@ -67,7 +93,7 @@ export default {
     const legacyRequest = request.clone();
     let update: TelegramUpdate;
     try {
-      update = await request.json<TelegramUpdate>();
+      update = await request.json() as TelegramUpdate;
     } catch {
       return jsonResponse({ ok: false, error: 'INVALID_TELEGRAM_UPDATE' }, 400);
     }
@@ -84,27 +110,20 @@ export default {
       return jsonResponse({ ok: true, ignored: true });
     }
 
-    const result = await processTelegramReceipt(env, {
+    const task = handleReceiptPhoto(env, {
       chatId,
       messageId,
       updateId: update.update_id,
       photo,
-      caption: update.message?.caption?.trim() || '',
-      localNow: getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai')
+      caption: update.message?.caption?.trim() || ''
     });
 
-    try {
-      await sendTelegramMessage(env, chatId, result.message);
-    } catch (error) {
-      console.error('telegram receipt reply failed', error instanceof Error ? error.message : 'unknown error');
+    if (ctx?.waitUntil) {
+      ctx.waitUntil(task);
+      return jsonResponse({ ok: true, receipt: true, accepted: true });
     }
 
-    return jsonResponse({
-      ok: true,
-      receipt: true,
-      recorded: result.ok,
-      duplicate: result.duplicate || false,
-      transaction_id: result.transactionId || null
-    });
+    await task;
+    return jsonResponse({ ok: true, receipt: true, accepted: true });
   }
 };
