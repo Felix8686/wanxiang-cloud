@@ -14,6 +14,10 @@ export interface AiLike {
   run(model: string, input: Record<string, unknown>): Promise<unknown>;
 }
 
+export interface QueueProducerLike {
+  send(message: unknown): Promise<void>;
+}
+
 export interface R2ObjectHeaderLike {
   name: string;
   size: number;
@@ -46,6 +50,7 @@ export interface Env {
   DB: D1Like;
   AI: AiLike;
   FILES: R2BucketLike;
+  RECEIPT_QUEUE?: QueueProducerLike;
   APP_TIMEZONE: string;
   AI_MODEL: string;
   RECEIPT_VISION_MODEL?: string;
@@ -142,6 +147,14 @@ export interface ReceiptReconciliation {
   expected_total_fen: number;
   receipt_total_fen: number;
   difference_fen: number;
+}
+
+export interface ReceiptProcessResult {
+  ok: boolean;
+  message: string;
+  transactionId?: string;
+  duplicate?: boolean;
+  itemCount?: number;
 }
 
 export interface SyncFileRecord {
