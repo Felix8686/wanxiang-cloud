@@ -48,6 +48,7 @@ export interface Env {
   APP_TIMEZONE: string;
   AI_MODEL: string;
   WANXIANG_API_KEY?: string;
+  OBSIDIAN_SYNC_API_KEY?: string;
   API_BEARER_TOKEN?: string;
   TELEGRAM_BOT_TOKEN?: string;
   TELEGRAM_WEBHOOK_SECRET?: string;
