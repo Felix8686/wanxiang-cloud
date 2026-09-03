@@ -115,14 +115,46 @@ export async function analyzeReceiptImage(
   caption: string,
   localNow: string
 ): Promise<ParsedReceipt> {
+  const firstPass = await analyzeReceiptImagePass(env, imageBytes, mimeType, caption, localNow, false);
+  if (firstPass.is_receipt) return firstPass;
+
+  // Real users often photograph narrow thermal receipts sideways, at an angle,
+  // or while holding them. A single conservative classification must not turn
+  // that into a false negative. Only rejected images receive this second pass.
+  console.info('receipt vision retry', JSON.stringify({ reason: 'first_pass_not_receipt' }));
+  const secondPass = await analyzeReceiptImagePass(env, imageBytes, mimeType, caption, localNow, true);
+  if (secondPass.is_receipt) return secondPass;
+
+  return secondPass.confidence >= firstPass.confidence ? secondPass : firstPass;
+}
+
+async function analyzeReceiptImagePass(
+  env: Env,
+  imageBytes: ArrayBuffer,
+  mimeType: string,
+  caption: string,
+  localNow: string,
+  verificationPass: boolean
+): Promise<ParsedReceipt> {
   const dataUri = `data:${mimeType};base64,${arrayBufferToBase64(imageBytes)}`;
   const model = env.RECEIPT_VISION_MODEL || DEFAULT_RECEIPT_VISION_MODEL;
   const userContext = caption.trim() ? `\n用户附加说明：${caption.trim().slice(0, 500)}` : '';
 
-  // Workers AI's native vision examples pass the image through the top-level
-  // `image` field. Structured-output responses may arrive as
-  // choices[0].message.parsed, so extraction below supports both the native
-  // response shape and JSON-mode response wrappers.
+  const orientationRules = [
+    '真实用户照片可能横着拍、倒着拍、倾斜拍摄，或小票只占画面的一部分。必须主动从 0/90/180/270 度四个方向理解票面，不能因为方向不正而判定为非小票。',
+    '手指、桌面、地毯、阴影、褶皱、透视变形和背景杂物都属于正常拍摄条件，不能单独作为拒绝理由。',
+    '如果画面中存在狭长热敏纸，并能看到商品/数量/单价/金额、合计、付款、时间、商家、条码等收据结构中的若干项，应优先按购物小票处理。',
+    '菜单、商品包装、普通文档、聊天截图即使有价格数字，也不能仅凭数字判定为小票；必须存在实际交易/结算结构。'
+  ];
+
+  const verificationRules = verificationPass
+    ? [
+        '这是第二次纠错确认。上一次模型曾判断它不像小票，因此这一次必须特别检查是否只是横向、倒置、倾斜、票面较小或背景干扰导致误判。',
+        '在输出 is_receipt=false 前，必须明确检查四种旋转方向，并寻找热敏纸、逐项商品金额、合计/实付、付款方式、交易时间、商家或条码等组合证据。',
+        '只要能确认这是实际交易产生的购物收据，即使部分文字模糊、商家名缺失或支付方式看不清，也应 is_receipt=true；无法确认的字段降低 confidence，而不是把整张真实小票否掉。'
+      ]
+    : [];
+
   const result = await env.AI.run(model, {
     messages: [
       {
@@ -130,7 +162,9 @@ export async function analyzeReceiptImage(
         content: [
           '你是“万象云端”的购物小票视觉解析器。只做识别和结构化，不执行数据库操作。',
           '目标是识别中文或中英混合的超市、便利店、商店购物小票。',
-          '先判断图片是否真的是购物小票/收据；普通照片、截图、商品包装、菜单等必须 is_receipt=false。',
+          ...orientationRules,
+          ...verificationRules,
+          '先判断是否是实际购物小票/收据，但不要把拍摄姿势、旋转方向或背景复杂度误当成“非小票”。',
           '商品必须逐行提取。折扣、满减、优惠券、税费、四舍五入不要伪装成商品行，分别放入对应字段。',
           'discount_amount 使用正数表示优惠减少的金额；tax_amount 使用正数；rounding_amount 可正可负。',
           '商品 category 只能从以下值选择：食品、饮料、生鲜、零食、日用品、清洁用品、个护、医药健康、母婴、宠物、家居、数码配件、服饰、其他。',
@@ -144,7 +178,9 @@ export async function analyzeReceiptImage(
       },
       {
         role: 'user',
-        content: `解析这张购物小票。${userContext}`
+        content: verificationPass
+          ? `重新从所有旋转方向检查并解析这张购物小票。不要因为横拍、倾斜或背景杂乱而误拒绝。${userContext}`
+          : `解析这张购物小票。${userContext}`
       }
     ],
     image: dataUri,
@@ -254,16 +290,12 @@ export function extractJsonValue(result: unknown): unknown {
 
   const record = result as Record<string, unknown>;
 
-  // Some structured-output adapters return the parsed object directly.
   if ('is_receipt' in record && 'items' in record) return record;
 
-  // Workers AI JSON mode may return { response: {...} } or a JSON string.
   const response = record.response;
   if (response && typeof response === 'object') return response;
   if (typeof response === 'string' && response.trim()) return parseJsonText(response);
 
-  // REST-like wrappers are accepted defensively even though the Worker binding
-  // normally returns the inner result directly.
   const nestedResult = record.result;
   if (nestedResult && typeof nestedResult === 'object') {
     try {
@@ -279,7 +311,6 @@ export function extractJsonValue(result: unknown): unknown {
   if (message && typeof message === 'object') {
     const messageRecord = message as Record<string, unknown>;
 
-    // Cloudflare structured-output examples expose the validated object here.
     const parsed = messageRecord.parsed;
     if (parsed && typeof parsed === 'object') return parsed;
     if (typeof parsed === 'string' && parsed.trim()) return parseJsonText(parsed);
@@ -302,8 +333,6 @@ export function extractJsonValue(result: unknown): unknown {
 
 function logAiResultShape(result: unknown): void {
   const shape = describeAiResultShape(result);
-  // Deliberately log only types/key names. Never log response content,
-  // receipt text, image bytes/data URI, file paths, or credentials.
   console.warn('receipt AI response shape', JSON.stringify(shape));
 }
 
