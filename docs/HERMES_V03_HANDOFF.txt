@@ -1,0 +1,180 @@
+Wanxiang Cloud v0.3 Hermes Validation Handoff
+
+Repository:
+https://github.com/Felix8686/wanxiang-cloud
+
+Branch:
+dev/v0.3-receipt-vision
+
+ROLE BOUNDARY
+
+This v0.3 code has already been designed and implemented in GitHub.
+Hermes is NOT the feature designer or primary coder for this phase.
+Hermes responsibilities are limited to:
+- pull the existing branch;
+- install dependencies;
+- run TypeScript/tests;
+- apply the new D1 migration in the dev environment;
+- deploy the dev Worker;
+- perform isolated and real Telegram E2E validation;
+- diagnose failures and report exact evidence.
+
+If a business-logic/code defect is found, do not redesign or broadly rewrite the implementation. Report the defect, file/line area, reproduction steps, logs/errors, and the smallest suggested fix back to the user for ChatGPT to implement. Only environment-specific, non-code adjustments needed for testing are allowed without code changes.
+
+DO NOT:
+- modify main;
+- merge the Draft PR;
+- build v0.4;
+- rotate or print existing secrets;
+- persist receipt photos;
+- delete existing real transactions;
+- rewrite v0.1/v0.2 logic;
+- substitute a different architecture on your own.
+
+CURRENT DESIGN
+
+Entry point:
+src/app.ts
+
+Legacy/core APIs and text Telegram messages are delegated to:
+src/index.ts
+
+Receipt pipeline:
+src/receipt.ts
+
+Migration:
+migrations/0003_transaction_items.sql
+
+Vision model default:
+@cf/google/gemma-4-26b-a4b-it
+
+Wrangler variable:
+RECEIPT_VISION_MODEL
+
+R2 is NOT used to store receipt photos.
+
+PRE-DEPLOY CHECKS
+
+1. git status must be clean after checkout.
+2. branch must be dev/v0.3-receipt-vision.
+3. npm install.
+4. npx tsc --noEmit.
+5. npm run test:receipt.
+6. wrangler deploy --dry-run (or equivalent safe build check).
+
+If TypeScript/test/build fails, stop before remote migration/deploy and report evidence.
+
+D1 MIGRATION
+
+Apply only the new migration through the normal migration mechanism.
+Do not edit or re-run migration files manually.
+Do not modify 0001_init.sql or 0002_sync_metadata.sql.
+
+Verify transaction_items exists with:
+- transaction_id FK;
+- quantity REAL;
+- unit_price_fen nullable integer;
+- line_total_fen integer;
+- category;
+- confidence.
+
+Before/after migration record current transactions count. Existing real transactions must remain unchanged.
+
+DEV DEPLOY
+
+Deploy only wanxiang-cloud-dev from this branch.
+Do not create a production Worker.
+Do not rotate:
+- WANXIANG_API_KEY
+- API_BEARER_TOKEN
+- OBSIDIAN_SYNC_API_KEY
+- TELEGRAM_BOT_TOKEN
+- TELEGRAM_WEBHOOK_SECRET
+
+Verify /health reports:
+- version 0.3.0
+- receipt_vision true
+- configured receipt vision model
+- D1/R2 bindings present.
+
+ISOLATED VALIDATION
+
+Use controlled fixtures before asking the user for a real receipt.
+Do not use the user's real receipt as the first test.
+
+Required cases:
+
+1. Existing text Telegram path
+Input: 晚饭25元，支付宝
+Expected: legacy flow still works.
+Clean up only the exact synthetic test transaction afterward.
+
+2. Existing query path
+Input: 今天花了多少
+Expected: legacy query still works and creates no transaction.
+
+3. Clear receipt image
+Expected:
+- Telegram getFile/download succeeds;
+- Vision returns is_receipt=true;
+- transaction + transaction_items written;
+- item/category values plausible;
+- amount reconciliation passes.
+
+4. Multi-category receipt
+Expected different item categories, not one category for the entire receipt.
+
+5. Amount mismatch fixture
+Expected no transaction write and a Telegram failure message.
+
+6. Non-receipt image
+Expected no transaction write.
+
+7. Duplicate photo
+Send/replay the same Telegram file_unique_id.
+Expected no duplicate transaction.
+
+8. Large/invalid image/download failure
+Expected safe failure, no transaction.
+
+9. Privacy
+Confirm no receipt image object appears in R2 and no file URL/token is stored in D1/Git/log output.
+
+After isolated testing, remove only clearly identified synthetic test transactions/items/ingestion fixtures. Do not touch real user data.
+
+REAL TELEGRAM E2E
+
+Only after all isolated validation passes, ask the user to send one real supermarket receipt photo from their Telegram client.
+
+Validate the real chain:
+Telegram photo
+-> webhook 200/accepted
+-> Telegram getFile
+-> image download
+-> Workers AI Vision
+-> structured receipt
+-> reconciliation
+-> transactions + transaction_items
+-> Telegram summary reply
+
+The user's real receipt is real accounting data. Do NOT delete it unless explicitly instructed.
+
+REPORT BACK
+
+Return concise evidence:
+1. TypeScript PASS/FAIL
+2. npm run test:receipt PASS/FAIL
+3. migration PASS/FAIL
+4. dev deploy PASS/FAIL
+5. actual vision model call PASS/FAIL
+6. Chinese receipt OCR result quality
+7. item extraction PASS/FAIL
+8. multi-category classification PASS/FAIL
+9. reconciliation PASS/FAIL
+10. non-receipt rejection PASS/FAIL
+11. duplicate-image idempotency PASS/FAIL
+12. legacy text/query regression PASS/FAIL
+13. real Telegram receipt E2E PASS/FAIL
+14. transaction/items counts before/after
+15. exact defects found, without broad code rewrites
+16. confirm main not modified and PR not merged
