@@ -7,6 +7,7 @@ export interface D1StatementLike {
 
 export interface D1Like {
   prepare(query: string): D1StatementLike;
+  batch(statements: D1StatementLike[]): Promise<unknown[]>;
 }
 
 export interface AiLike {
@@ -47,6 +48,7 @@ export interface Env {
   FILES: R2BucketLike;
   APP_TIMEZONE: string;
   AI_MODEL: string;
+  RECEIPT_VISION_MODEL?: string;
   WANXIANG_API_KEY?: string;
   OBSIDIAN_SYNC_API_KEY?: string;
   API_BEARER_TOKEN?: string;
@@ -70,13 +72,76 @@ export interface ParsedIntake {
   confidence: number;
 }
 
+export interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: {
     message_id: number;
     chat: { id: number };
     text?: string;
+    caption?: string;
+    photo?: TelegramPhotoSize[];
   };
+}
+
+export type ReceiptItemCategory =
+  | '食品'
+  | '饮料'
+  | '生鲜'
+  | '零食'
+  | '日用品'
+  | '清洁用品'
+  | '个护'
+  | '医药健康'
+  | '母婴'
+  | '宠物'
+  | '家居'
+  | '数码配件'
+  | '服饰'
+  | '其他';
+
+export interface ParsedReceiptItem {
+  name: string;
+  quantity: number;
+  unit_price: number | null;
+  line_total: number;
+  category: ReceiptItemCategory;
+  confidence: number;
+}
+
+export interface ParsedReceipt {
+  is_receipt: boolean;
+  merchant: string;
+  occurred_at: string;
+  currency: string;
+  total_amount: number;
+  subtotal_amount: number | null;
+  discount_amount: number;
+  tax_amount: number;
+  rounding_amount: number;
+  payment_method: string;
+  confidence: number;
+  total_confidence: number;
+  items: ParsedReceiptItem[];
+  rejection_reason: string;
+}
+
+export interface ReceiptReconciliation {
+  ok: boolean;
+  items_total_fen: number;
+  discount_fen: number;
+  tax_fen: number;
+  rounding_fen: number;
+  expected_total_fen: number;
+  receipt_total_fen: number;
+  difference_fen: number;
 }
 
 export interface SyncFileRecord {
