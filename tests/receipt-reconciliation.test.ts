@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { buildReceiptSourceId, reconcileReceipt } from '../src/receipt';
+import { buildReceiptSourceId, describeAiResultShape, extractJsonValue, reconcileReceipt } from '../src/receipt';
 import type { ParsedReceipt, TelegramPhotoSize } from '../src/types';
 
 function receipt(overrides: Partial<ParsedReceipt> = {}): ParsedReceipt {
@@ -69,6 +69,39 @@ function receipt(overrides: Partial<ParsedReceipt> = {}): ParsedReceipt {
     buildReceiptSourceId(12345, photo, 99, 88),
     'receipt_12345_stable-photo-id'
   );
+}
+
+{
+  const parsed = receipt();
+  assert.deepEqual(
+    extractJsonValue({ choices: [{ message: { parsed } }] }),
+    parsed
+  );
+}
+
+{
+  const parsed = receipt({ merchant: 'JSON Mode 超市' });
+  assert.deepEqual(extractJsonValue({ response: parsed }), parsed);
+}
+
+{
+  const parsed = receipt({ merchant: 'Content 超市' });
+  assert.deepEqual(
+    extractJsonValue({ choices: [{ message: { content: JSON.stringify(parsed) } }] }),
+    parsed
+  );
+}
+
+{
+  const shape = describeAiResultShape({
+    id: 'not-sensitive',
+    choices: [{ message: { parsed: receipt(), content: null } }]
+  });
+  assert.deepEqual(shape.topKeys, ['id', 'choices']);
+  assert.equal(shape.choicesLength, 1);
+  assert.equal(shape.parsedType, 'object');
+  assert.equal(shape.contentType, 'object');
+  assert.equal(Object.prototype.hasOwnProperty.call(shape, 'content'), false);
 }
 
 console.log('receipt reconciliation tests: PASS');
