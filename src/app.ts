@@ -64,7 +64,7 @@ export default {
       return jsonResponse({
         ok: true,
         service: 'wanxiang-cloud',
-        version: '0.3.1',
+        version: '0.3.2',
         receipt_vision: true,
         receipt_queue_bound: !!env.RECEIPT_QUEUE,
         receipt_vision_model: env.RECEIPT_VISION_MODEL || '@cf/google/gemma-4-26b-a4b-it',
