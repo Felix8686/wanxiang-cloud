@@ -10,10 +10,6 @@ import type {
 const DEFAULT_RECEIPT_VISION_MODEL = '@cf/google/gemma-4-26b-a4b-it';
 const MAX_RECEIPT_IMAGE_BYTES = 8 * 1024 * 1024;
 const MAX_RECEIPT_ITEMS = 200;
-const RECEIPT_CONFIDENCE_MIN = 0.8;
-const TOTAL_CONFIDENCE_MIN = 0.9;
-const ITEM_CONFIDENCE_MIN = 0.55;
-const MAX_LOW_CONFIDENCE_ITEM_RATIO = 0.25;
 const RECONCILIATION_TOLERANCE_FEN = 2;
 
 const ITEM_CATEGORIES: ReceiptItemCategory[] = [
@@ -68,14 +64,6 @@ export interface DownloadedTelegramPhoto {
   filePath: string;
 }
 
-export interface ReceiptProcessResult {
-  ok: boolean;
-  message: string;
-  transactionId?: string;
-  duplicate?: boolean;
-  itemCount?: number;
-}
-
 export function selectLargestPhoto(photos: TelegramPhotoSize[]): TelegramPhotoSize | null {
   if (!Array.isArray(photos) || photos.length === 0) return null;
   return [...photos].sort((a, b) => {
@@ -94,7 +82,9 @@ export async function downloadTelegramPhoto(env: Env, photo: TelegramPhotoSize):
   if (!env.TELEGRAM_BOT_TOKEN) throw new Error('TELEGRAM_BOT_TOKEN_NOT_CONFIGURED');
   if (photo.file_size && photo.file_size > MAX_RECEIPT_IMAGE_BYTES) throw new Error('RECEIPT_IMAGE_TOO_LARGE');
 
-  const getFileResponse = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(photo.file_id)}`);
+  const getFileResponse = await fetch(
+    `https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/getFile?file_id=${encodeURIComponent(photo.file_id)}`
+  );
   if (!getFileResponse.ok) throw new Error(`TELEGRAM_GET_FILE_HTTP_${getFileResponse.status}`);
 
   const payload = await getFileResponse.json() as {
@@ -129,6 +119,10 @@ export async function analyzeReceiptImage(
   const model = env.RECEIPT_VISION_MODEL || DEFAULT_RECEIPT_VISION_MODEL;
   const userContext = caption.trim() ? `\n用户附加说明：${caption.trim().slice(0, 500)}` : '';
 
+  // Workers AI's native vision examples pass the image through the top-level
+  // `image` field. Structured-output responses may arrive as
+  // choices[0].message.parsed, so extraction below supports both the native
+  // response shape and JSON-mode response wrappers.
   const result = await env.AI.run(model, {
     messages: [
       {
@@ -144,24 +138,25 @@ export async function analyzeReceiptImage(
           '不要猜数字。金额或商品行看不清时降低 confidence/total_confidence。',
           'occurred_at 尽量输出 YYYY-MM-DDTHH:mm:ss；确实看不清则返回空字符串。',
           'currency 默认 CNY。payment_method 看不清返回“未识别”。',
-          '只输出 JSON，不输出 Markdown，不输出解释文字。',
+          '只输出符合指定 schema 的 JSON，不输出 Markdown，不输出解释文字。',
           `当前本地时间：${localNow}。`
         ].join('\n')
       },
       {
         role: 'user',
-        content: [
-          { type: 'text', text: `解析这张购物小票。${userContext}` },
-          { type: 'image_url', image_url: { url: dataUri } }
-        ]
+        content: `解析这张购物小票。${userContext}`
       }
     ],
+    image: dataUri,
     response_format: {
       type: 'json_schema',
       json_schema: receiptSchema
     },
+    chat_template_kwargs: {
+      enable_thinking: false
+    },
     temperature: 0,
-    max_tokens: 5000
+    max_completion_tokens: 5000
   });
 
   return validateReceipt(extractJsonValue(result));
@@ -186,131 +181,6 @@ export function reconcileReceipt(receipt: ParsedReceipt): ReceiptReconciliation 
     receipt_total_fen: receiptTotalFen,
     difference_fen: differenceFen
   };
-}
-
-export async function processTelegramReceipt(
-  env: Env,
-  input: {
-    chatId: number;
-    messageId: number;
-    updateId: number;
-    photo: TelegramPhotoSize;
-    caption: string;
-    localNow: string;
-  }
-): Promise<ReceiptProcessResult> {
-  const source = 'telegram';
-  const sourceId = buildReceiptSourceId(input.chatId, input.photo, input.messageId, input.updateId);
-
-  const existingTransaction = await env.DB.prepare(
-    'SELECT id FROM transactions WHERE source = ? AND source_id = ? LIMIT 1'
-  ).bind(source, sourceId).first<{ id: string }>();
-  if (existingTransaction?.id) {
-    return { ok: true, duplicate: true, transactionId: existingTransaction.id, message: '这张小票已经记录过，没有重复记账。' };
-  }
-
-  const lockId = crypto.randomUUID();
-  await env.DB.prepare(`
-    INSERT OR IGNORE INTO ingestion_log (id, source, source_id, intent, raw_text, status, error_message, created_at)
-    VALUES (?, ?, ?, 'receipt_image', ?, 'processing', NULL, CURRENT_TIMESTAMP)
-  `).bind(lockId, source, sourceId, input.caption.trim().slice(0, 1000) || null).run();
-
-  const lock = await env.DB.prepare(
-    'SELECT id, status FROM ingestion_log WHERE source = ? AND source_id = ? LIMIT 1'
-  ).bind(source, sourceId).first<{ id: string; status: string }>();
-  if (!lock || lock.id !== lockId) {
-    return { ok: true, duplicate: true, message: lock?.status === 'processing' ? '这张小票正在处理中，请稍候。' : '这张小票已经处理过，没有重复记账。' };
-  }
-
-  try {
-    const downloaded = await downloadTelegramPhoto(env, input.photo);
-    const receipt = await analyzeReceiptImage(env, downloaded.bytes, downloaded.mimeType, input.caption, input.localNow);
-
-    if (!receipt.is_receipt) {
-      await updateReceiptIngestion(env, source, sourceId, 'rejected', receipt.rejection_reason || 'not a shopping receipt');
-      return { ok: false, message: '这张图片看起来不像购物小票，没有记账。' };
-    }
-
-    const safetyError = validateReceiptSafety(receipt);
-    if (safetyError) {
-      await updateReceiptIngestion(env, source, sourceId, 'rejected', safetyError);
-      return { ok: false, message: `小票识别结果不够可靠，没有记账。${humanizeSafetyError(safetyError)}` };
-    }
-
-    const reconciliation = reconcileReceipt(receipt);
-    if (!reconciliation.ok) {
-      await updateReceiptIngestion(
-        env,
-        source,
-        sourceId,
-        'rejected',
-        `amount mismatch difference_fen=${reconciliation.difference_fen}`
-      );
-      return { ok: false, message: '小票金额核对失败，请确认小票是否拍摄完整、清晰后再发送。' };
-    }
-
-    const transactionId = crypto.randomUUID();
-    const accountId = await resolveReceiptAccountId(env, receipt.payment_method);
-    const categoryId = resolveReceiptTopLevelCategory(receipt.items);
-    const occurredAt = normalizeOccurredAt(receipt.occurred_at, input.localNow);
-    const merchant = cleanText(receipt.merchant, 160) || '未识别商家';
-    const description = `购物小票 · ${merchant} · ${receipt.items.length}项`;
-    const statements = [
-      env.DB.prepare(`
-        INSERT INTO transactions (
-          id, type, amount_fen, currency, account_id, category_id, merchant, description,
-          occurred_at, source, source_id, raw_text, created_at, updated_at
-        ) VALUES (?, 'expense', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-      `).bind(
-        transactionId,
-        reconciliation.receipt_total_fen,
-        receipt.currency || 'CNY',
-        accountId,
-        categoryId,
-        merchant,
-        description,
-        occurredAt,
-        source,
-        sourceId,
-        input.caption.trim().slice(0, 1000) || null
-      ),
-      ...receipt.items.map((item) => env.DB.prepare(`
-        INSERT INTO transaction_items (
-          id, transaction_id, name, quantity, unit_price_fen, line_total_fen, category, confidence, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-      `).bind(
-        crypto.randomUUID(),
-        transactionId,
-        item.name,
-        item.quantity,
-        item.unit_price === null ? null : yuanToFen(item.unit_price),
-        yuanToFen(item.line_total),
-        item.category,
-        item.confidence
-      )),
-      env.DB.prepare(`
-        UPDATE ingestion_log
-        SET intent = 'receipt_image', status = 'parsed', error_message = NULL
-        WHERE source = ? AND source_id = ?
-      `).bind(source, sourceId)
-    ];
-
-    await env.DB.batch(statements);
-
-    return {
-      ok: true,
-      transactionId,
-      itemCount: receipt.items.length,
-      message: formatReceiptSummary(receipt, reconciliation)
-    };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    await updateReceiptIngestion(env, source, sourceId, 'failed', message.slice(0, 300));
-    if (message === 'RECEIPT_IMAGE_TOO_LARGE') {
-      return { ok: false, message: '小票图片太大，请重新发送一张较小或经过 Telegram 压缩的照片。' };
-    }
-    return { ok: false, message: '小票识别失败，数据未写入。请重新拍清晰一些再发送。' };
-  }
 }
 
 export function formatReceiptSummary(receipt: ParsedReceipt, reconciliation: ReceiptReconciliation): string {
@@ -348,7 +218,9 @@ function validateReceipt(value: unknown): ParsedReceipt {
     occurred_at: cleanText(v.occurred_at, 40),
     currency: cleanText(v.currency, 8).toUpperCase() || 'CNY',
     total_amount: toNonNegativeNumber(v.total_amount),
-    subtotal_amount: v.subtotal_amount === null || v.subtotal_amount === undefined ? null : toNonNegativeNumber(v.subtotal_amount),
+    subtotal_amount: v.subtotal_amount === null || v.subtotal_amount === undefined
+      ? null
+      : toNonNegativeNumber(v.subtotal_amount),
     discount_amount: toNonNegativeNumber(v.discount_amount),
     tax_amount: toNonNegativeNumber(v.tax_amount),
     rounding_amount: toFiniteNumber(v.rounding_amount, 0),
@@ -373,77 +245,89 @@ function validateReceiptItem(value: unknown): ParsedReceiptItem {
   };
 }
 
-function validateReceiptSafety(receipt: ParsedReceipt): string | null {
-  if (!receipt.is_receipt) return 'NOT_RECEIPT';
-  if (!Number.isFinite(receipt.total_amount) || receipt.total_amount <= 0 || receipt.total_amount > 1_000_000) return 'INVALID_TOTAL';
-  if (receipt.confidence < RECEIPT_CONFIDENCE_MIN) return 'LOW_RECEIPT_CONFIDENCE';
-  if (receipt.total_confidence < TOTAL_CONFIDENCE_MIN) return 'LOW_TOTAL_CONFIDENCE';
-  if (receipt.items.length === 0 || receipt.items.length > MAX_RECEIPT_ITEMS) return 'INVALID_ITEM_COUNT';
-
-  let lowConfidenceItems = 0;
-  for (const item of receipt.items) {
-    if (!item.name || item.quantity <= 0 || item.quantity > 10000) return 'INVALID_ITEM';
-    if (!Number.isFinite(item.line_total) || item.line_total < 0 || item.line_total > 1_000_000) return 'INVALID_ITEM_AMOUNT';
-    if (item.confidence < ITEM_CONFIDENCE_MIN) lowConfidenceItems += 1;
+export function extractJsonValue(result: unknown): unknown {
+  if (typeof result === 'string') return parseJsonText(result);
+  if (!result || typeof result !== 'object') {
+    logAiResultShape(result);
+    throw new Error('RECEIPT_AI_EMPTY_RESPONSE');
   }
-  if (lowConfidenceItems / receipt.items.length > MAX_LOW_CONFIDENCE_ITEM_RATIO) return 'TOO_MANY_LOW_CONFIDENCE_ITEMS';
-  return null;
-}
 
-async function resolveReceiptAccountId(env: Env, paymentMethod: string): Promise<string> {
-  const method = paymentMethod.trim();
-  if (!method || method === '未识别') return 'account-unspecified';
+  const record = result as Record<string, unknown>;
 
-  const candidates = [method];
-  if (/支付宝/.test(method)) candidates.push('支付宝');
-  if (/微信/.test(method)) candidates.push('微信');
-  if (/现金/.test(method)) candidates.push('现金');
+  // Some structured-output adapters return the parsed object directly.
+  if ('is_receipt' in record && 'items' in record) return record;
 
-  for (const candidate of candidates) {
-    const row = await env.DB.prepare('SELECT id FROM accounts WHERE name LIKE ? LIMIT 1')
-      .bind(`%${candidate}%`).first<{ id: string }>();
-    if (row?.id) return row.id;
-  }
-  return 'account-unspecified';
-}
-
-function resolveReceiptTopLevelCategory(items: ParsedReceiptItem[]): string {
-  let foodFen = 0;
-  let dailyFen = 0;
-  let otherFen = 0;
-  for (const item of items) {
-    const fen = yuanToFen(item.line_total);
-    if (['食品', '饮料', '生鲜', '零食'].includes(item.category)) foodFen += fen;
-    else if (['日用品', '清洁用品', '个护', '家居'].includes(item.category)) dailyFen += fen;
-    else otherFen += fen;
-  }
-  if (foodFen >= dailyFen && foodFen >= otherFen) return 'cat-expense-food';
-  if (dailyFen >= foodFen && dailyFen >= otherFen) return 'cat-expense-daily';
-  return 'cat-expense-other';
-}
-
-async function updateReceiptIngestion(env: Env, source: string, sourceId: string, status: string, errorMessage: string | null): Promise<void> {
-  await env.DB.prepare(`
-    UPDATE ingestion_log
-    SET intent = 'receipt_image', status = ?, error_message = ?
-    WHERE source = ? AND source_id = ?
-  `).bind(status, errorMessage, source, sourceId).run();
-}
-
-function extractJsonValue(result: unknown): unknown {
-  const record = result && typeof result === 'object' ? result as Record<string, unknown> : null;
-  const response = record?.response;
+  // Workers AI JSON mode may return { response: {...} } or a JSON string.
+  const response = record.response;
   if (response && typeof response === 'object') return response;
-  if (typeof response === 'string') return parseJsonText(response);
+  if (typeof response === 'string' && response.trim()) return parseJsonText(response);
 
-  const choices = Array.isArray(record?.choices) ? record?.choices as Array<Record<string, unknown>> : [];
+  // REST-like wrappers are accepted defensively even though the Worker binding
+  // normally returns the inner result directly.
+  const nestedResult = record.result;
+  if (nestedResult && typeof nestedResult === 'object') {
+    try {
+      return extractJsonValue(nestedResult);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== 'RECEIPT_AI_EMPTY_RESPONSE') throw error;
+    }
+  }
+  if (typeof nestedResult === 'string' && nestedResult.trim()) return parseJsonText(nestedResult);
+
+  const choices = Array.isArray(record.choices) ? record.choices as Array<Record<string, unknown>> : [];
   const message = choices[0]?.message;
   if (message && typeof message === 'object') {
-    const content = (message as Record<string, unknown>).content;
-    if (typeof content === 'string') return parseJsonText(content);
+    const messageRecord = message as Record<string, unknown>;
+
+    // Cloudflare structured-output examples expose the validated object here.
+    const parsed = messageRecord.parsed;
+    if (parsed && typeof parsed === 'object') return parsed;
+    if (typeof parsed === 'string' && parsed.trim()) return parseJsonText(parsed);
+
+    const content = messageRecord.content;
+    if (typeof content === 'string' && content.trim()) return parseJsonText(content);
+    if (Array.isArray(content)) {
+      const text = content
+        .map((part) => part && typeof part === 'object' ? (part as Record<string, unknown>).text : undefined)
+        .filter((value): value is string => typeof value === 'string')
+        .join('\n')
+        .trim();
+      if (text) return parseJsonText(text);
+    }
   }
-  if (typeof result === 'string') return parseJsonText(result);
+
+  logAiResultShape(result);
   throw new Error('RECEIPT_AI_EMPTY_RESPONSE');
+}
+
+function logAiResultShape(result: unknown): void {
+  const shape = describeAiResultShape(result);
+  // Deliberately log only types/key names. Never log response content,
+  // receipt text, image bytes/data URI, file paths, or credentials.
+  console.warn('receipt AI response shape', JSON.stringify(shape));
+}
+
+export function describeAiResultShape(result: unknown): Record<string, unknown> {
+  if (result === null) return { type: 'null' };
+  if (Array.isArray(result)) return { type: 'array', length: result.length };
+  if (typeof result !== 'object') return { type: typeof result };
+
+  const record = result as Record<string, unknown>;
+  const choices = Array.isArray(record.choices) ? record.choices as Array<Record<string, unknown>> : [];
+  const message = choices[0]?.message;
+  const messageRecord = message && typeof message === 'object' ? message as Record<string, unknown> : null;
+
+  return {
+    type: 'object',
+    topKeys: Object.keys(record).slice(0, 20),
+    responseType: record.response === null ? 'null' : typeof record.response,
+    resultType: record.result === null ? 'null' : typeof record.result,
+    choicesLength: choices.length,
+    firstChoiceKeys: choices[0] ? Object.keys(choices[0]).slice(0, 20) : [],
+    messageKeys: messageRecord ? Object.keys(messageRecord).slice(0, 20) : [],
+    parsedType: messageRecord?.parsed === null ? 'null' : typeof messageRecord?.parsed,
+    contentType: Array.isArray(messageRecord?.content) ? 'array' : typeof messageRecord?.content
+  };
 }
 
 function parseJsonText(text: string): unknown {
@@ -477,12 +361,6 @@ function normalizeImageMimeType(contentType: string | null, filePath: string): s
   return 'image/jpeg';
 }
 
-function normalizeOccurredAt(value: string, fallback: string): string {
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2})?/.test(value)) return value.slice(0, 19);
-  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return `${value}T12:00:00`;
-  return fallback;
-}
-
 function yuanToFen(value: number): number {
   return Math.round(Math.max(0, value) * 100);
 }
@@ -514,19 +392,4 @@ function clampConfidence(value: unknown): number {
 
 function cleanText(value: unknown, maxLength: number): string {
   return typeof value === 'string' ? value.trim().slice(0, maxLength) : '';
-}
-
-function humanizeSafetyError(code: string): string {
-  switch (code) {
-    case 'LOW_RECEIPT_CONFIDENCE':
-    case 'LOW_TOTAL_CONFIDENCE':
-    case 'TOO_MANY_LOW_CONFIDENCE_ITEMS':
-      return '请把小票铺平、保证光线充足并重新拍摄。';
-    case 'INVALID_ITEM_COUNT':
-    case 'INVALID_ITEM':
-    case 'INVALID_ITEM_AMOUNT':
-      return '商品明细存在无法确认的内容，请重新拍清晰一些。';
-    default:
-      return '请重新拍摄完整小票。';
-  }
 }
