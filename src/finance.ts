@@ -113,8 +113,8 @@ function getLocalDateParts(timeZone: string, now = new Date()): { year: number; 
 function monthRange(year: number, month: number): { start: string; end: string; label: string } {
   const next = addMonths(year, month, 1);
   return {
-    start: `${dateString(year, month, 1)}T00:00:00`,
-    end: `${dateString(next.year, next.month, 1)}T00:00:00`,
+    start: dateString(year, month, 1),
+    end: dateString(next.year, next.month, 1),
     label: `${year}年${month}月`
   };
 }
@@ -122,8 +122,8 @@ function monthRange(year: number, month: number): { start: string; end: string; 
 function dayRange(year: number, month: number, day: number, label: string): { start: string; end: string; label: string } {
   const next = addDays(year, month, day, 1);
   return {
-    start: `${dateString(year, month, day)}T00:00:00`,
-    end: `${dateString(next.year, next.month, next.day)}T00:00:00`,
+    start: dateString(year, month, day),
+    end: dateString(next.year, next.month, next.day),
     label
   };
 }
@@ -170,8 +170,8 @@ function parseApiRange(url: URL, timeZone: string): { start: string; end: string
     const [toYear, toMonth, toDay] = to.split('-').map(Number);
     const afterTo = addDays(toYear, toMonth, toDay, 1);
     return {
-      start: `${from}T00:00:00`,
-      end: `${dateString(afterTo.year, afterTo.month, afterTo.day)}T00:00:00`,
+      start: from,
+      end: dateString(afterTo.year, afterTo.month, afterTo.day),
       label: `${from} 至 ${to}`
     };
   }
@@ -212,6 +212,17 @@ export function parseFinanceTextQuery(text: string, timeZone: string, now = new 
     return { mode, ...range, page, limit: TELEGRAM_PAGE_SIZE };
   }
 
+  const cnDay = /(20\d{2})\s*年\s*(1[0-2]|0?[1-9])\s*月\s*(3[01]|[12]\d|0?[1-9])\s*日?/.exec(normalized);
+  if (cnDay) {
+    const year = Number(cnDay[1]);
+    const month = Number(cnDay[2]);
+    const day = Number(cnDay[3]);
+    if (isValidDate(dateString(year, month, day))) {
+      const range = dayRange(year, month, day, `${year}年${month}月${day}日`);
+      return { mode, ...range, page, limit: TELEGRAM_PAGE_SIZE };
+    }
+  }
+
   const cnMonth = /(20\d{2})\s*年\s*(1[0-2]|0?[1-9])\s*月/.exec(normalized);
   if (cnMonth) {
     const range = monthRange(Number(cnMonth[1]), Number(cnMonth[2]));
@@ -242,7 +253,7 @@ async function getSummary(env: Env, start: string, end: string): Promise<{
       COALESCE(SUM(CASE WHEN type = 'income' THEN amount_fen ELSE 0 END), 0) AS income_fen,
       COALESCE(SUM(CASE WHEN type = 'transfer' THEN amount_fen ELSE 0 END), 0) AS transfer_fen
     FROM transactions
-    WHERE occurred_at >= ? AND occurred_at < ?
+    WHERE substr(occurred_at, 1, 10) >= ? AND substr(occurred_at, 1, 10) < ?
   `).bind(start, end).first<SummaryRow>();
 
   const categories = await env.DB.prepare(`
@@ -252,7 +263,7 @@ async function getSummary(env: Env, start: string, end: string): Promise<{
       COUNT(*) AS transaction_count
     FROM transactions t
     LEFT JOIN categories c ON c.id = t.category_id
-    WHERE t.type = 'expense' AND t.occurred_at >= ? AND t.occurred_at < ?
+    WHERE t.type = 'expense' AND substr(t.occurred_at, 1, 10) >= ? AND substr(t.occurred_at, 1, 10) < ?
     GROUP BY COALESCE(c.name, '未指定')
     ORDER BY total_fen DESC, category_name ASC
     LIMIT 10
@@ -282,7 +293,7 @@ async function getTransactions(
   limit: number,
   type?: 'expense' | 'income' | 'transfer'
 ): Promise<{ items: TransactionRow[]; total: number; page: number; limit: number; pages: number }> {
-  const where = ["t.occurred_at >= ?", "t.occurred_at < ?"];
+  const where = ["substr(t.occurred_at, 1, 10) >= ?", "substr(t.occurred_at, 1, 10) < ?"];
   const binds: unknown[] = [start, end];
   if (type) {
     where.push('t.type = ?');
