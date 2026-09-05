@@ -8,7 +8,9 @@
     "deploy": "wrangler deploy",
     "types": "wrangler types",
     "typecheck": "tsc --noEmit",
+    "test": "npm run test:receipt && npm run test:finance",
     "test:receipt": "tsx tests/receipt-reconciliation.test.ts && tsx tests/receipt-resolver.test.ts",
+    "test:finance": "tsx tests/finance-query.test.ts",
     "db:migrate:local": "wrangler d1 migrations apply wanxiang-cloud-dev --local",
     "db:migrate:remote": "wrangler d1 migrations apply wanxiang-cloud-dev --remote"
   },
