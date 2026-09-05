@@ -165,7 +165,6 @@ export async function rememberFinanceContext(
         updated_at = CURRENT_TIMESTAMP
     `).bind(chatId, query.start, query.end, query.label, mode, userText.slice(0, 500)).run();
   } catch (error) {
-    // Keep v1 queries working even if the context migration has not been applied yet.
     console.error('finance context save failed', error instanceof Error ? error.message : 'unknown error');
   }
 }
@@ -191,9 +190,10 @@ async function classifyFinanceConversation(
   env: Env,
   text: string,
   context: FinanceConversationContext | null,
-  timeZone: string
+  timeZone: string,
+  now: Date
 ): Promise<FinanceConversationRoute | null> {
-  const local = getLocalDateParts(timeZone);
+  const local = getLocalDateParts(timeZone, now);
   const contextText = context
     ? `最近一次财务查询：${context.last_label}，范围 ${context.last_start} 至 ${context.last_end}，模式 ${context.last_mode}。`
     : '没有可继承的最近财务查询。';
@@ -455,22 +455,22 @@ async function buildComparisonReply(env: Env, query: FinanceTextQuery): Promise<
 export async function handleFinanceConversationTelegram(
   env: Env,
   chatId: string,
-  text: string
+  text: string,
+  now = new Date()
 ): Promise<FinanceConversationResult | null> {
   const timeZone = env.APP_TIMEZONE || 'Asia/Shanghai';
   const context = await loadFinanceContext(env, chatId);
-  const deterministic = parseFinanceTextQuery(text, timeZone);
+  const deterministic = parseFinanceTextQuery(text, timeZone, now);
   const analytical = looksLikeFinanceAnalysis(text);
   const contextual = Boolean(context && looksLikeContextualFollowup(text));
 
-  // Keep ordinary v1 queries on the fast deterministic path. AI is used when semantics/context are actually needed.
   if (deterministic && !analytical && !contextual) return null;
   if (!context && !analytical && !hasFinanceSignal(text)) return null;
 
-  const route = await classifyFinanceConversation(env, text, context, timeZone);
+  const route = await classifyFinanceConversation(env, text, context, timeZone, now);
   if (!route || route.action === 'passthrough' || route.confidence < 0.55) return null;
 
-  const query = resolveConversationQuery(route, context, timeZone);
+  const query = resolveConversationQuery(route, context, timeZone, now);
   if (!query) return null;
 
   let reply: string;
