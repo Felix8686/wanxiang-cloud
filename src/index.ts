@@ -1,6 +1,8 @@
 import { parseIntake } from './ai';
+import { resolveAccountId, resolveCategoryId } from './finance-reference';
 import { generateObjectKey, normalizeRelativePath, computeSha256, getSyncFileRecord, listSyncFiles } from './sync';
-import type { Env, ParsedIntake, TelegramUpdate, SyncFileRecord } from './types';
+import { resolveTelegramReferenceTime } from './telegram-time';
+import type { Env, TelegramUpdate } from './types';
 
 function jsonResponse(data: unknown, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -30,19 +32,13 @@ function getBearerOrSecret(env: Env): string | undefined {
 }
 
 function getLocalNow(timeZone: string): string {
-  try {
-    return new Intl.DateTimeFormat('sv-SE', {
-      timeZone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    }).format(new Date()).replace(' ', 'T');
-  } catch {
-    return new Date().toISOString();
-  }
+  return resolveTelegramReferenceTime(undefined, timeZone);
+}
+
+function fallbackCategoryName(type: 'expense' | 'income' | 'transfer'): string {
+  if (type === 'income') return '其他收入';
+  if (type === 'transfer') return '转账';
+  return '其他支出';
 }
 
 export default {
@@ -375,6 +371,7 @@ export default {
           text?: string;
           source?: string;
           source_id?: string;
+          reference_time?: string;
         };
 
         if (!body.text || typeof body.text !== 'string') {
@@ -399,9 +396,10 @@ export default {
           });
         }
 
-        // 2. AI Parsing
-        const localNow = getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai');
-        const parsed = await parseIntake(env, body.text, localNow);
+        // 2. AI Parsing. For Telegram, reference_time is the message's own server timestamp,
+        // not the later Worker processing time after a reconnect or queue delay.
+        const referenceLocalNow = body.reference_time || getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai');
+        const parsed = await parseIntake(env, body.text, referenceLocalNow);
 
         // 3. Log Ingestion
         const logId = crypto.randomUUID();
@@ -437,10 +435,11 @@ export default {
         }
 
         if (parsed.intent === 'spending_today') {
+          const referenceDate = referenceLocalNow.slice(0, 10);
           const queryRes = await env.DB.prepare(`
             SELECT SUM(amount_fen) as total_fen FROM transactions
-            WHERE type = 'expense' AND date(occurred_at) = date('now')
-          `).first<{ total_fen: number | null }>();
+            WHERE type = 'expense' AND substr(occurred_at, 1, 10) = ?
+          `).bind(referenceDate).first<{ total_fen: number | null }>();
 
           const totalFen = queryRes?.total_fen || 0;
           const totalYuan = (totalFen / 100).toFixed(2);
@@ -453,34 +452,13 @@ export default {
         }
 
         if (parsed.intent === 'create_transaction') {
-          // Resolve Account
-          let accountId = 'account-unspecified';
-          if (parsed.account_name && parsed.account_name !== '未指定') {
-            const acc = await env.DB.prepare(
-              'SELECT id FROM accounts WHERE name LIKE ?'
-            )
-              .bind(`%${parsed.account_name}%`)
-              .first<{ id: string }>();
-            if (acc) {
-              accountId = acc.id;
-            }
-          }
+          const accountId = await resolveAccountId(env, parsed.account_name)
+            || await resolveAccountId(env, '未指定');
+          if (!accountId) throw new Error('ACCOUNT_NOT_CONFIGURED');
 
-          // Resolve Category
-          let categoryId = parsed.transaction_type === 'income' ? 'cat-income-other' : 'cat-expense-other';
-          if (parsed.transaction_type === 'transfer') {
-            categoryId = 'cat-transfer';
-          }
-          if (parsed.category_name && parsed.category_name !== '其他支出' && parsed.category_name !== '其他收入') {
-            const cat = await env.DB.prepare(
-              'SELECT id FROM categories WHERE name LIKE ?'
-            )
-              .bind(`%${parsed.category_name}%`)
-              .first<{ id: string }>();
-            if (cat) {
-              categoryId = cat.id;
-            }
-          }
+          const categoryId = await resolveCategoryId(env, parsed.category_name, parsed.transaction_type)
+            || await resolveCategoryId(env, fallbackCategoryName(parsed.transaction_type), parsed.transaction_type);
+          if (!categoryId) throw new Error('CATEGORY_NOT_CONFIGURED');
 
           const amountFen = Math.round(parsed.amount * 100);
           const txId = crypto.randomUUID();
@@ -488,8 +466,8 @@ export default {
           await env.DB.prepare(`
             INSERT INTO transactions (
               id, type, amount_fen, currency, account_id, category_id,
-              description, raw_text, source, source_id, occurred_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+              merchant, description, raw_text, source, source_id, occurred_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
           `)
             .bind(
               txId,
@@ -498,6 +476,7 @@ export default {
               parsed.currency,
               accountId,
               categoryId,
+              parsed.merchant || null,
               parsed.description || parsed.category_name,
               body.text,
               source,
@@ -506,7 +485,7 @@ export default {
             )
             .run();
 
-          const typeLabel = parsed.transaction_type === 'income' ? '收入' : '支出';
+          const typeLabel = parsed.transaction_type === 'income' ? '收入' : parsed.transaction_type === 'transfer' ? '转账' : '支出';
           const msg = `已记录${typeLabel} ¥${parsed.amount.toFixed(2)} · ${parsed.category_name} · ${parsed.account_name}`;
 
           return jsonResponse({
@@ -516,7 +495,10 @@ export default {
               transaction_id: txId,
               type: parsed.transaction_type,
               amount: parsed.amount,
-              category: parsed.category_name
+              category: parsed.category_name,
+              account: parsed.account_name,
+              merchant: parsed.merchant || null,
+              occurred_at: parsed.occurred_at
             }
           });
         }
@@ -547,6 +529,11 @@ export default {
           return jsonResponse({ ok: true, ignored: true });
         }
 
+        const referenceTime = resolveTelegramReferenceTime(
+          update.message?.date,
+          env.APP_TIMEZONE || 'Asia/Shanghai'
+        );
+
         // Delegate to intake handler logic
         const intakeReq = new Request('https://worker.local/v1/intake', {
           method: 'POST',
@@ -557,7 +544,8 @@ export default {
           body: JSON.stringify({
             text,
             source: 'telegram',
-            source_id: `tg_${update.message?.message_id || update.update_id}`
+            source_id: `tg_${update.message?.message_id || update.update_id}`,
+            reference_time: referenceTime
           })
         });
 
