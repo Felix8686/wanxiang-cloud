@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "run_id": "finance-fidelity-2026-09-05-v1",
+  "records": [
+    {
+      "transaction_id": "EXISTING-D1-TRANSACTION-ID",
+      "transaction_type": "expense",
+      "category_name": "烟酒",
+      "payment_method": {
+        "status": "resolved",
+        "name": "微信"
+      },
+      "expected_current_category": "其他支出",
+      "expected_current_account": "未指定",
+      "evidence": {
+        "category_source": "normalized historical ledger original category",
+        "payment_source": "Notion page mirror relation"
+      }
+    },
+    {
+      "transaction_id": "AMBIGUOUS-PAYMENT-EXAMPLE",
+      "transaction_type": "expense",
+      "category_name": "烟酒",
+      "payment_method": {
+        "status": "ambiguous",
+        "candidates": ["微信", "支付宝"]
+      },
+      "expected_current_category": "其他支出",
+      "expected_current_account": "未指定",
+      "evidence": {
+        "note": "ambiguous payment is intentionally not restored automatically"
+      }
+    }
+  ]
+}

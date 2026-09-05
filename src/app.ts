@@ -13,6 +13,7 @@ import {
   handleFinanceConversationTelegram,
   rememberFinanceContext
 } from './finance-conversation';
+import { resolveTelegramReferenceTime, telegramMessageDateToDate } from './telegram-time';
 import type { Env, TelegramUpdate } from './types';
 import type { ReceiptQueueJob } from './receipt-job';
 
@@ -31,22 +32,6 @@ function jsonResponse(data: unknown, status = 200): Response {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8' }
   });
-}
-
-function getLocalNow(timeZone: string): string {
-  try {
-    return new Intl.DateTimeFormat('sv-SE', {
-      timeZone,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit'
-    }).format(new Date()).replace(' ', 'T');
-  } catch {
-    return new Date().toISOString();
-  }
 }
 
 async function sendTelegramMessage(env: Env, chatId: number, text: string): Promise<void> {
@@ -76,13 +61,15 @@ export default {
       return jsonResponse({
         ok: true,
         service: 'wanxiang-cloud',
-        version: '0.5.0',
+        version: '0.6.0',
         receipt_vision: true,
         receipt_provider: 'veryfi',
         receipt_provider_configured: isVeryfiConfigured(env),
         receipt_queue_bound: !!env.RECEIPT_QUEUE,
         finance_history_query: true,
         finance_conversation: true,
+        dynamic_finance_taxonomy: true,
+        telegram_event_time: true,
         r2_bound: !!env.FILES,
         d1_bound: !!env.DB
       });
@@ -114,13 +101,13 @@ export default {
       return jsonResponse({ ok: false, error: 'INVALID_TELEGRAM_UPDATE' }, 400);
     }
 
+    const timeZone = env.APP_TIMEZONE || 'Asia/Shanghai';
+    const eventDate = telegramMessageDateToDate(update.message?.date) || new Date();
     const chatId = update.message?.chat?.id;
     const text = update.message?.text?.trim();
     if (chatId && text) {
-      // v0.5: let AI resolve semantic/contextual finance follow-ups first.
-      // Ordinary deterministic queries still stay on the fast v1 path.
       try {
-        const conversation = await handleFinanceConversationTelegram(env, String(chatId), text);
+        const conversation = await handleFinanceConversationTelegram(env, String(chatId), text, eventDate);
         if (conversation) {
           await sendTelegramMessageSafely(env, chatId, conversation.reply);
           return jsonResponse({
@@ -134,7 +121,7 @@ export default {
         console.error('telegram finance conversation failed', error instanceof Error ? error.message : 'unknown error');
       }
 
-      const financeQuery = parseFinanceTextQuery(text, env.APP_TIMEZONE || 'Asia/Shanghai');
+      const financeQuery = parseFinanceTextQuery(text, timeZone, eventDate);
       if (financeQuery) {
         try {
           const reply = await formatFinanceTelegramReply(env, financeQuery);
@@ -166,7 +153,7 @@ export default {
       updateId: update.update_id,
       photo,
       caption: update.message?.caption?.trim() || '',
-      localNow: getLocalNow(env.APP_TIMEZONE || 'Asia/Shanghai')
+      localNow: resolveTelegramReferenceTime(update.message?.date, timeZone)
     };
 
     const enqueueResult = await enqueueReceiptJob(env, job);
