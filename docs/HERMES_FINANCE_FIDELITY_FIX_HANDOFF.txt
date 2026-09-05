@@ -1,0 +1,181 @@
+任务：验证 finance fidelity + Telegram event-time 修复，并准备历史数据恢复计划。
+
+仓库：Felix8686/wanxiang-cloud
+分支：fix/finance-fidelity-and-telegram-time-v1
+基线 main：40e3c4a737bb44cd81d5bb411c17c5824b5864d2
+
+重要边界：
+- 本轮只做 feature 分支验证、只读生产核对、以及离线恢复计划生成。
+- 不修改 main。
+- 不合并 PR。
+- 不部署 Worker。
+- 不执行 production D1 migration 0005。
+- 不执行 production D1 UPDATE / INSERT / DELETE。
+- 不运行生成的 production apply.sql。
+
+一、代码门禁
+
+1. git fetch origin
+2. checkout fix/finance-fidelity-and-telegram-time-v1
+3. 确认 HEAD 与 origin 同步，工作区 clean。
+4. npm ci
+5. npm run typecheck
+6. npm test
+7. npx wrangler deploy --dry-run
+
+全部必须 PASS。
+
+二、验证本次代码修复目标
+
+A. 动态分类体系
+
+确认 src/ai.ts 不再把支出硬编码限制为：
+餐饮 / 日用品 / 交通 / 其他支出。
+
+确认 AI 输入解析会读取 D1 当前 active categories 和 accounts，并把真实列表交给 AI。
+
+确认：
+- AI 只能从当前 D1 分类/账户列表选择；
+- 未说明支付方式时仍返回“未指定”；
+- 不存在的 AI 自创分类会被受控代码回退；
+- category/account 最终使用精确匹配，而不是模糊 LIKE；
+- parsed.merchant 现在会真正写入 transactions.merchant；
+- description/raw_text 仍保留。
+
+使用测试中的模拟 taxonomy（至少包含“烟酒”“微信”“建行”）验证：
+“硬盒红塔山一盒，10元”具备被映射到“烟酒”的完整代码条件，而不是被迫进入“日用品/其他支出”。
+本轮不要调用 production Telegram 创建真实记录。
+
+B. Telegram 延迟消息时间
+
+确认 TelegramUpdate.message.date 已被读取。
+
+验证以下三条链路都使用 Telegram message.date 作为参考时间，而不是 Worker 晚到后的处理时间：
+1. 普通文字记账 /v1/intake
+2. 财务查询和连续对话中的“今天/昨天/本月”等相对时间
+3. 小票 OCR 在票面缺少明确时间时使用的 localNow
+
+运行 tests/intake-fidelity.test.ts，确认 Asia/Shanghai 时区转换 PASS。
+
+C. today 查询 UTC 边界
+
+确认旧 core spending_today 不再使用 date('now')，而是使用参考本地日期与 substr(occurred_at,1,10) 比较。
+
+三、migration 0005 本地验证
+
+只在隔离本地 D1 执行 0005_finance_fidelity_recovery_log.sql。
+
+确认：
+- 只新增 finance_fidelity_recovery_log 及索引；
+- transactions schema 不变；
+- categories/accounts schema 不变；
+- 原有 0001—0004 migration 仍兼容。
+
+四、根据已完成的字段保真审计，生成标准恢复 manifest
+
+审计资料目录：
+D:\finance-history-migration-2026-09-05\
+
+优先使用：
+- reports\field-fidelity-audit.md
+- reports\field-fidelity-audit-evidence.json
+- 迁移时的 normalized ledger / imported ID 清单
+- Notion 页面镜像支付方式 Relation 证据
+
+生成一个标准 JSON manifest，格式严格参考：
+docs/finance-fidelity-recovery-manifest.example.json
+
+manifest 要求：
+
+每个待恢复 transaction 必须包含：
+- transaction_id：必须是现有 D1 historical transaction ID
+- transaction_type
+- category_name：来自 normalized historical ledger 的原始分类文本，不得由 AI 猜测
+- expected_current_category：当前 D1 只读查询得到的分类名
+- expected_current_account：当前 D1 只读查询得到的账户名
+- payment_method：
+  - 唯一可靠候选 => status=resolved + name
+  - 多候选冲突 => status=ambiguous + candidates
+  - 无可靠来源 => status=missing
+- evidence：写明类别来源和支付方式来源，禁止放 Token/Secret/API Key
+
+特别要求：
+- “烟酒”等原始分类必须原样恢复，不再压缩为“其他支出”。
+- 4 条支付方式冲突必须保持 ambiguous，不得自动拍脑袋选择。
+- 没有可靠支付方式来源的记录保持未指定。
+- 不推断不可恢复的二级分类、商家、备注或 Relation 对象语义。
+
+五、生成离线恢复 SQL（只生成，不执行生产）
+
+运行：
+
+npm run finance:recovery:plan -- --manifest <manifest.json> --out-dir <output-dir>
+
+必须得到：
+- apply.sql
+- rollback.sql
+- summary.json
+
+检查：
+- apply.sql 只允许新增缺失 taxonomy（categories/accounts）、写 recovery journal、更新 category_id/account_id；
+- 不允许改 amount_fen、currency、type、occurred_at、description、merchant、raw_text、source、source_id；
+- 每条 UPDATE 都必须先通过 transaction id + expected current category + expected current account guard 写入 recovery journal；
+- ambiguous/missing payment 不得被自动更新账户；
+- rollback.sql 能按 run_id 恢复每条记录原来的 category_id/account_id。
+
+六、隔离本地恢复演练
+
+在本地 D1 建立代表性测试数据，至少覆盖：
+1. 烟酒 -> 当前 D1 其他支出 + 未指定账户 + resolved 微信
+2. 烟酒 -> 当前 D1 其他支出 + ambiguous 微信/支付宝
+3. 原本分类已正确、只恢复支付方式
+4. 当前 category/account 与 expected 不一致（guard 必须阻止更新）
+5. 其他扫码付
+6. 建行
+
+执行顺序：
+- 记录 baseline
+- 本地执行 apply.sql
+- 校验 journal 数量必须等于 summary.json planned_updates（guard mismatch 用例除外时，应按测试设计明确计数）
+- 校验只改变 category_id/account_id
+- 校验金额/日期/方向/描述/raw_text 完全不变
+- 本地执行 rollback.sql
+- 校验 category_id/account_id 精确恢复 baseline
+
+七、生产只读核对
+
+只允许 SELECT：
+- transactions 当前总数、总金额、收入/支出汇总
+- 当前 category=其他支出 数量
+- 当前 account=未指定 数量
+- 当前 categories/accounts 名单
+- 随机抽样 manifest 中至少 100 条，确认 transaction_id + expected current category/account 与生产 D1 一致
+
+不得执行 apply.sql。
+
+八、最终报告
+
+标题：
+《finance fidelity + Telegram event-time 修复：feature 分支验收与恢复计划报告》
+
+只汇报：
+1. 总体 PASS / FAIL
+2. feature HEAD
+3. main 是否保持 40e3c4a737bb44cd81d5bb411c17c5824b5864d2
+4. typecheck
+5. npm test
+6. dry-run
+7. 0005 本地 migration
+8. 动态分类/账户验证
+9. “红塔山→烟酒”代码条件验证
+10. Telegram message.date 三条链路验证
+11. spending_today 时区边界验证
+12. manifest 总记录数
+13. planned category changes
+14. planned account changes
+15. ambiguous payment 数量
+16. missing payment 数量
+17. 本地 apply/rollback 演练
+18. 生产只读 100 条 guard 抽样
+19. 是否修改任何生产数据：必须为否
+20. 是否可以进入“合并 PR → 生产恢复 → Worker 部署”阶段：是 / 否
