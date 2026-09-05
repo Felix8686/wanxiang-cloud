@@ -1,0 +1,76 @@
+任务：验证 feat/finance-history-query-v1 分支的“历史财务查询 v1”。
+
+边界：
+- 不修改 main。
+- 不合并 PR。
+- 不写入/删除生产 D1 财务数据。
+- 不发送会新增账目的 Telegram 测试消息。
+- 如需部署验证，优先使用安全的非生产/预览方式；未经用户明确授权不要替换当前生产 Version 47。
+
+目标能力：
+1. GET /v1/transactions
+   - Bearer 鉴权。
+   - 支持 month=YYYY-MM、date=YYYY-MM-DD、from/to。
+   - 支持 type=expense|income|transfer。
+   - page/limit 分页，limit 最大 100。
+2. GET /v1/stats 与 /v1/summary
+   - 返回记录数、收入、支出、转账、结余、支出分类排行。
+3. POST /v1/intake
+   - 历史/今天财务查询由确定性解析处理，不调用新增记账逻辑。
+4. Telegram 文本查询
+   - 今天/昨天/本月/上月。
+   - 指定 YYYY年M月。
+   - 指定 YYYY年M月D日。
+   - “明细 第N页”分页。
+5. 时区修复
+   - 不再依赖 SQLite date('now') 作为本次查询入口的日期边界。
+   - 使用 APP_TIMEZONE=Asia/Shanghai 计算本地日期，并按 occurred_at 前10位日期查询，兼容历史数据的日期/时间格式差异。
+
+执行：
+1. 拉取 GitHub 分支 feat/finance-history-query-v1，确认 main 仍为 f371cb4f126d1e29ae012e155c2d446c04b99f5a。
+2. npm ci
+3. npm run typecheck
+4. npm test
+5. npx wrangler deploy --dry-run（或当前 Wrangler 等价 dry-run），不得实际部署生产。
+6. 对生产 D1 只读 SQL 建立基准，再以本分支代码在安全环境验证 API 结果。
+
+必须核对的已知生产基准：
+- 2024-02：91 条；收入 ¥6,465.00；支出 ¥3,307.00。
+- 2026-08：116 条；收入 ¥1,000.00；支出 ¥2,195.43。
+- 2022-02-18：D1 存在 ¥19.00 餐饮“五花肉”记录。
+
+重点验收：
+A. /v1/stats?month=2024-02 与 D1 基准完全一致。
+B. /v1/stats?month=2026-08 与 D1 基准完全一致。
+C. /v1/transactions?date=2022-02-18 能返回对应历史记录。
+D. /v1/transactions?month=2024-02&limit=20&page=1..N 无重复、无漏项，总数 91。
+E. 未授权访问返回 401。
+F. 非财务文本（如“晚饭25元”）仍走原记账链路，不应被历史查询误拦截；测试时不要实际写生产，可通过单测/本地环境验证。
+G. Telegram 查询格式至少验证解析结果：
+   - 今天支出多少
+   - 上个月花了多少
+   - 查一下2024年2月支出
+   - 2024年2月明细 第2页
+   - 查2022年2月18日支出
+H. 小票/队列相关现有测试继续 PASS。
+
+如果发现问题：
+- 不在 main 修。
+- 不部署生产。
+- 记录失败用例、错误日志、预期/实际结果和必要代码位置，交回 ChatGPT 修改。
+
+最终只汇报：
+1. 总体 PASS/FAIL
+2. 当前测试 HEAD
+3. npm run typecheck
+4. npm test（各测试数量）
+5. Wrangler dry-run
+6. 2024-02 API vs D1
+7. 2026-08 API vs D1
+8. 2022-02-18 历史记录查询
+9. 分页完整性
+10. 鉴权
+11. Telegram 解析
+12. 是否修改 main：必须否
+13. 是否部署生产：必须否
+14. 阻塞项（如有）

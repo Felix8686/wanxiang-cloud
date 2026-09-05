@@ -3,6 +3,12 @@ import { selectLargestPhoto } from './receipt';
 import { enqueueReceiptJob } from './receipt-job';
 import { processReceiptQueueJobV2 } from './receipt-job-v2';
 import { isVeryfiConfigured } from './receipt-provider';
+import {
+  formatFinanceTelegramReply,
+  handleFinanceApiRequest,
+  handleFinanceIntakeQuery,
+  parseFinanceTextQuery
+} from './finance';
 import type { Env, TelegramUpdate } from './types';
 import type { ReceiptQueueJob } from './receipt-job';
 
@@ -66,15 +72,22 @@ export default {
       return jsonResponse({
         ok: true,
         service: 'wanxiang-cloud',
-        version: '0.3.4',
+        version: '0.4.0',
         receipt_vision: true,
         receipt_provider: 'veryfi',
         receipt_provider_configured: isVeryfiConfigured(env),
         receipt_queue_bound: !!env.RECEIPT_QUEUE,
+        finance_history_query: true,
         r2_bound: !!env.FILES,
         d1_bound: !!env.DB
       });
     }
+
+    const financeApiResponse = await handleFinanceApiRequest(request, env);
+    if (financeApiResponse) return financeApiResponse;
+
+    const financeIntakeResponse = await handleFinanceIntakeQuery(request, env);
+    if (financeIntakeResponse) return financeIntakeResponse;
 
     if (url.pathname !== '/telegram/webhook' || method !== 'POST') {
       return coreHandler.fetch(request, env);
@@ -96,12 +109,28 @@ export default {
       return jsonResponse({ ok: false, error: 'INVALID_TELEGRAM_UPDATE' }, 400);
     }
 
+    const chatId = update.message?.chat?.id;
+    const text = update.message?.text?.trim();
+    if (chatId && text) {
+      const financeQuery = parseFinanceTextQuery(text, env.APP_TIMEZONE || 'Asia/Shanghai');
+      if (financeQuery) {
+        try {
+          const reply = await formatFinanceTelegramReply(env, financeQuery);
+          await sendTelegramMessageSafely(env, chatId, reply);
+          return jsonResponse({ ok: true, finance_query: true });
+        } catch (error) {
+          console.error('telegram finance query failed', error instanceof Error ? error.message : 'unknown error');
+          await sendTelegramMessageSafely(env, chatId, '财务查询失败，请稍后重试。');
+          return jsonResponse({ ok: false, error: 'FINANCE_QUERY_FAILED' }, 500);
+        }
+      }
+    }
+
     const photos = update.message?.photo;
     if (!photos || photos.length === 0) {
       return coreHandler.fetch(legacyRequest, env);
     }
 
-    const chatId = update.message?.chat?.id;
     const messageId = update.message?.message_id;
     const photo = selectLargestPhoto(photos);
     if (!chatId || !messageId || !photo) {
