@@ -9,6 +9,10 @@ import {
   handleFinanceIntakeQuery,
   parseFinanceTextQuery
 } from './finance';
+import {
+  handleFinanceConversationTelegram,
+  rememberFinanceContext
+} from './finance-conversation';
 import type { Env, TelegramUpdate } from './types';
 import type { ReceiptQueueJob } from './receipt-job';
 
@@ -72,12 +76,13 @@ export default {
       return jsonResponse({
         ok: true,
         service: 'wanxiang-cloud',
-        version: '0.4.0',
+        version: '0.5.0',
         receipt_vision: true,
         receipt_provider: 'veryfi',
         receipt_provider_configured: isVeryfiConfigured(env),
         receipt_queue_bound: !!env.RECEIPT_QUEUE,
         finance_history_query: true,
+        finance_conversation: true,
         r2_bound: !!env.FILES,
         d1_bound: !!env.DB
       });
@@ -112,10 +117,28 @@ export default {
     const chatId = update.message?.chat?.id;
     const text = update.message?.text?.trim();
     if (chatId && text) {
+      // v0.5: let AI resolve semantic/contextual finance follow-ups first.
+      // Ordinary deterministic queries still stay on the fast v1 path.
+      try {
+        const conversation = await handleFinanceConversationTelegram(env, String(chatId), text);
+        if (conversation) {
+          await sendTelegramMessageSafely(env, chatId, conversation.reply);
+          return jsonResponse({
+            ok: true,
+            finance_query: true,
+            finance_conversation: true,
+            action: conversation.action
+          });
+        }
+      } catch (error) {
+        console.error('telegram finance conversation failed', error instanceof Error ? error.message : 'unknown error');
+      }
+
       const financeQuery = parseFinanceTextQuery(text, env.APP_TIMEZONE || 'Asia/Shanghai');
       if (financeQuery) {
         try {
           const reply = await formatFinanceTelegramReply(env, financeQuery);
+          await rememberFinanceContext(env, String(chatId), financeQuery, text);
           await sendTelegramMessageSafely(env, chatId, reply);
           return jsonResponse({ ok: true, finance_query: true });
         } catch (error) {
